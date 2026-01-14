@@ -10,10 +10,12 @@ import com.the_qa_company.qendpoint.core.util.io.compress.CompressNodeReader;
 import com.the_qa_company.qendpoint.core.util.io.compress.CompressUtil;
 import com.the_qa_company.qendpoint.core.iterator.utils.AsyncIteratorFetcher;
 import com.the_qa_company.qendpoint.core.iterator.utils.SizeFetcher;
+import com.the_qa_company.qendpoint.core.iterator.utils.SizedSupplier;
 import com.the_qa_company.qendpoint.core.util.concurrent.ExceptionFunction;
 import com.the_qa_company.qendpoint.core.util.concurrent.ExceptionSupplier;
 import com.the_qa_company.qendpoint.core.util.concurrent.ExceptionThread;
 import com.the_qa_company.qendpoint.core.util.concurrent.KWayMerger;
+import com.the_qa_company.qendpoint.core.util.concurrent.KWayMergerChunked;
 import com.the_qa_company.qendpoint.core.util.io.CloseSuppressPath;
 import com.the_qa_company.qendpoint.core.util.io.IOUtil;
 import com.the_qa_company.qendpoint.core.util.listener.IntermediateListener;
@@ -39,17 +41,20 @@ import java.util.function.Supplier;
  *
  * @author Antoine Willerval
  */
-public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString, SizeFetcher<TripleString>> {
+public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString, SizedSupplier<TripleString>>,
+		KWayMergerChunked.KWayMergerChunkedImpl<TripleString, SizedSupplier<TripleString>> {
 	private static final Logger log = LoggerFactory.getLogger(SectionCompressor.class);
 
 	private final CloseSuppressPath baseFileName;
-	private final AsyncIteratorFetcher<TripleString> source;
+	private final AsyncIteratorFetcher<TripleString> source; // may be null in
+																// pull-mode
 	private final MultiThreadListener listener;
 	private final AtomicLong triples = new AtomicLong();
 	private final AtomicLong ntRawSize = new AtomicLong();
 	private final int bufferSize;
 	private final long chunkSize;
 	private final int k;
+	private final int maxConcurrentMerges;
 	private final boolean debugSleepKwayDict;
 	private final boolean quads;
 	private final CompressionType compressionType;
@@ -58,15 +63,36 @@ public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString
 	public SectionCompressor(CloseSuppressPath baseFileName, AsyncIteratorFetcher<TripleString> source,
 			MultiThreadListener listener, int bufferSize, long chunkSize, int k, boolean debugSleepKwayDict,
 			boolean quads, CompressionType compressionType) {
+		this(baseFileName, source, listener, bufferSize, chunkSize, k, debugSleepKwayDict, quads, compressionType,
+				Integer.MAX_VALUE);
+	}
+
+	public SectionCompressor(CloseSuppressPath baseFileName, AsyncIteratorFetcher<TripleString> source,
+			MultiThreadListener listener, int bufferSize, long chunkSize, int k, boolean debugSleepKwayDict,
+			boolean quads, CompressionType compressionType, int maxConcurrentMerges) {
 		this.source = source;
 		this.listener = listener;
 		this.baseFileName = baseFileName;
 		this.bufferSize = bufferSize;
 		this.chunkSize = chunkSize;
 		this.k = k;
+		this.maxConcurrentMerges = maxConcurrentMerges <= 0 ? Integer.MAX_VALUE : maxConcurrentMerges;
 		this.debugSleepKwayDict = debugSleepKwayDict;
 		this.quads = quads;
 		this.compressionType = compressionType;
+	}
+
+	public SectionCompressor(CloseSuppressPath baseFileName, MultiThreadListener listener, int bufferSize,
+			long chunkSize, int k, boolean debugSleepKwayDict, boolean quads, CompressionType compressionType) {
+		this(baseFileName, listener, bufferSize, chunkSize, k, debugSleepKwayDict, quads, compressionType,
+				Integer.MAX_VALUE);
+	}
+
+	public SectionCompressor(CloseSuppressPath baseFileName, MultiThreadListener listener, int bufferSize,
+			long chunkSize, int k, boolean debugSleepKwayDict, boolean quads, CompressionType compressionType,
+			int maxConcurrentMerges) {
+		this(baseFileName, null, listener, bufferSize, chunkSize, k, debugSleepKwayDict, quads, compressionType,
+				maxConcurrentMerges);
 	}
 
 	/*
@@ -81,6 +107,12 @@ public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString
 	 * @return the subject mapped
 	 */
 	protected ByteString convertSubject(CharSequence seq) {
+		if (seq instanceof CompactString cs) {
+			return cs;
+		}
+		if (seq instanceof ByteString bs) {
+			return new CompactString(bs);
+		}
 		return new CompactString(seq);
 	}
 
@@ -92,6 +124,12 @@ public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString
 	 * @return the predicate mapped
 	 */
 	protected ByteString convertPredicate(CharSequence seq) {
+		if (seq instanceof CompactString cs) {
+			return cs;
+		}
+		if (seq instanceof ByteString bs) {
+			return new CompactString(bs);
+		}
 		return new CompactString(seq);
 	}
 
@@ -103,6 +141,12 @@ public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString
 	 * @return the graph mapped
 	 */
 	protected ByteString convertGraph(CharSequence seq) {
+		if (seq instanceof CompactString cs) {
+			return cs;
+		}
+		if (seq instanceof ByteString bs) {
+			return new CompactString(bs);
+		}
 		return new CompactString(seq);
 	}
 
@@ -114,6 +158,12 @@ public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString
 	 * @return the object mapped
 	 */
 	protected ByteString convertObject(CharSequence seq) {
+		if (seq instanceof CompactString cs) {
+			return cs;
+		}
+		if (seq instanceof ByteString bs) {
+			return new CompactString(bs);
+		}
 		return new CompactString(seq);
 	}
 
@@ -130,14 +180,20 @@ public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString
 	 */
 	public CompressionResult compressToFile(int workers)
 			throws IOException, InterruptedException, KWayMerger.KWayMergerException {
+		if (source == null) {
+			throw new IllegalStateException(
+					"compressToFile(workers) requires a source; use compressPull(...) instead.");
+		}
 		// force to create the first file
-		KWayMerger<TripleString, SizeFetcher<TripleString>> merger = new KWayMerger<>(baseFileName, source, this,
-				Math.max(1, workers - 1), k);
+		int workerThreads = Math.max(1, workers - 1);
+		int mergeLimit = Math.min(workerThreads, maxConcurrentMerges);
+		KWayMerger<TripleString, SizedSupplier<TripleString>> merger = new KWayMerger<>(baseFileName, source, this,
+				workerThreads, k, mergeLimit);
 		merger.start();
 		// wait for the workers to merge the sections and create the triples
 		Optional<CloseSuppressPath> sections = merger.waitResult();
 		if (sections.isEmpty()) {
-			return new CompressionResultEmpty();
+			return new CompressionResultEmpty(supportsGraph());
 		}
 		return new CompressionResultFile(triples.get(), ntRawSize.get(), new TripleFile(sections.get(), false),
 				supportsGraph());
@@ -153,6 +209,9 @@ public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString
 	 * @see #compress(int, String)
 	 */
 	public CompressionResult compressPartial() throws IOException, KWayMerger.KWayMergerException {
+		if (source == null) {
+			throw new IllegalStateException("compressPartial() requires a source; use compressPull(...) instead.");
+		}
 		List<TripleFile> files = new ArrayList<>();
 		baseFileName.closeWithDeleteRecurse();
 		try {
@@ -205,8 +264,73 @@ public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString
 		};
 	}
 
+	public CompressionResult compressPull(int workers, String mode,
+			ExceptionSupplier<SizedSupplier<TripleString>, IOException> chunkSupplier)
+			throws KWayMerger.KWayMergerException, IOException, InterruptedException {
+		if (mode == null) {
+			mode = "";
+		}
+
+		return switch (mode) {
+		case "", CompressionResult.COMPRESSION_MODE_COMPLETE -> compressToFilePull(workers, chunkSupplier);
+		case CompressionResult.COMPRESSION_MODE_PARTIAL -> compressPartialPull(chunkSupplier);
+		default -> throw new IllegalArgumentException("Unknown compression mode: " + mode);
+		};
+	}
+
+	public CompressionResult compressToFilePull(int workers,
+			ExceptionSupplier<SizedSupplier<TripleString>, IOException> chunkSupplier)
+			throws IOException, InterruptedException, KWayMerger.KWayMergerException {
+		int workerThreads = Math.max(1, workers - 1);
+		int mergeLimit = Math.min(workerThreads, maxConcurrentMerges);
+		KWayMergerChunked<TripleString, SizedSupplier<TripleString>> merger = new KWayMergerChunked<>(baseFileName,
+				chunkSupplier, this, workerThreads, k, mergeLimit);
+
+		merger.start();
+		Optional<CloseSuppressPath> sections = merger.waitResult();
+		if (sections.isEmpty()) {
+			return new CompressionResultEmpty(supportsGraph());
+		}
+		return new CompressionResultFile(triples.get(), ntRawSize.get(), new TripleFile(sections.get(), false),
+				supportsGraph());
+	}
+
+	public CompressionResult compressPartialPull(
+			ExceptionSupplier<SizedSupplier<TripleString>, IOException> chunkSupplier)
+			throws IOException, KWayMerger.KWayMergerException {
+		List<TripleFile> files = new ArrayList<>();
+		baseFileName.closeWithDeleteRecurse();
+
+		try {
+			baseFileName.mkdirs();
+			long fileName = 0;
+
+			while (true) {
+				SizedSupplier<TripleString> chunk = chunkSupplier.get();
+				if (chunk == null) {
+					break;
+				}
+
+				TripleFile file = new TripleFile(baseFileName.resolve("chunk#" + fileName++), true);
+				createChunk(chunk, file.root);
+				files.add(file);
+			}
+		} catch (Throwable e) {
+			try {
+				throw e;
+			} finally {
+				try {
+					IOUtil.closeAll(files);
+				} finally {
+					baseFileName.close();
+				}
+			}
+		}
+		return new CompressionResultPartial(files, triples.get(), ntRawSize.get(), supportsGraph());
+	}
+
 	@Override
-	public void createChunk(SizeFetcher<TripleString> fetcher, CloseSuppressPath output)
+	public void createChunk(SizedSupplier<TripleString> fetcher, CloseSuppressPath output)
 			throws KWayMerger.KWayMergerException {
 
 		listener.notifyProgress(0, "start reading triples");
@@ -337,7 +461,7 @@ public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString
 	}
 
 	@Override
-	public SizeFetcher<TripleString> newStopFlux(Supplier<TripleString> flux) {
+	public SizedSupplier<TripleString> newStopFlux(Supplier<TripleString> flux) {
 		return SizeFetcher.ofTripleString(flux, chunkSize);
 	}
 

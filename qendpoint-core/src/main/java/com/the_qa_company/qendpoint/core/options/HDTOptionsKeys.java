@@ -53,6 +53,17 @@ public class HDTOptionsKeys {
 	@Key(type = Key.Type.NUMBER, desc = "Number of core used to compress the HDT")
 	public static final String LOADER_DISK_COMPRESSION_WORKER_KEY = "loader.disk.compressWorker";
 	/**
+	 * Key for the maximum number of concurrent merge tasks during the disk
+	 * generation pipeline. This is independent from chunk creation concurrency
+	 * (controlled by {@link #LOADER_DISK_COMPRESSION_WORKER_KEY}).
+	 * <p>
+	 * Reducing this value can reduce I/O thrashing on some storage devices by
+	 * limiting how many merge passes read from many files simultaneously.
+	 * </p>
+	 */
+	@Key(type = Key.Type.NUMBER, desc = "Maximum number of concurrent merge tasks during disk generation")
+	public static final String LOADER_DISK_MERGE_CONCURRENCY_KEY = "loader.disk.mergeConcurrency";
+	/**
 	 * Key for the maximum size of a chunk on disk for the {@link HDTManager}
 	 * generateHDTDisk methods, the chunk should be in RAM before writing it on
 	 * disk and should be sorted. long value.

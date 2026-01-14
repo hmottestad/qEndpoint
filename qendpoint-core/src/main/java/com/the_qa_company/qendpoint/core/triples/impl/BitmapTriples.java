@@ -41,8 +41,8 @@ import com.the_qa_company.qendpoint.core.hdt.impl.diskindex.ObjectAdjReader;
 import com.the_qa_company.qendpoint.core.header.Header;
 import com.the_qa_company.qendpoint.core.iterator.SequentialSearchIteratorTripleID;
 import com.the_qa_company.qendpoint.core.iterator.SuppliableIteratorTripleID;
-import com.the_qa_company.qendpoint.core.iterator.utils.AsyncIteratorFetcher;
 import com.the_qa_company.qendpoint.core.iterator.utils.ExceptionIterator;
+import com.the_qa_company.qendpoint.core.iterator.utils.IteratorChunkedSource;
 import com.the_qa_company.qendpoint.core.listener.MultiThreadListener;
 import com.the_qa_company.qendpoint.core.listener.ProgressListener;
 import com.the_qa_company.qendpoint.core.options.ControlInfo;
@@ -619,9 +619,9 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		}
 
 		// start the indexing
-		DiskIndexSort sort = new DiskIndexSort(CloseSuppressPath.of(diskLocation).resolve("chunks"),
-				new AsyncIteratorFetcher<>(new ObjectAdjReader(seqZ, seqY, bitmapZ)), listener, bufferSize, chunkSize,
-				k, Comparator.<Pair>comparingLong(p -> p.object).thenComparingLong(p -> p.predicate));
+		DiskIndexSort sort = new DiskIndexSort(CloseSuppressPath.of(diskLocation).resolve("chunks"), listener,
+				bufferSize, chunkSize, k,
+				Comparator.<Pair>comparingLong(p -> p.object).thenComparingLong(p -> p.predicate));
 
 		// Serialize
 		DynamicSequence indexZ = null;
@@ -632,7 +632,11 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 
 		try {
 			try {
-				ExceptionIterator<Pair, IOException> sortedPairs = sort.sort(workers);
+				ExceptionIterator<Pair, IOException> sortedPairs;
+				try (IteratorChunkedSource<Pair> chunkSource = IteratorChunkedSource.of(
+						new ObjectAdjReader(seqZ, seqY, bitmapZ), p -> 3L * Long.BYTES, Math.max(1, chunkSize), null)) {
+					sortedPairs = sort.sortPull(workers, chunkSource);
+				}
 
 				log.info("Pair sorted in {}", global.stopAndShow());
 

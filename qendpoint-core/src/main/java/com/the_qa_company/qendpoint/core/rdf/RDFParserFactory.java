@@ -128,7 +128,7 @@ public class RDFParserFactory {
 	public static PipedCopyIterator<TripleString> readAsIterator(RDFParserCallback parser, InputStream stream,
 			String baseUri, boolean keepBNode, RDFNotation notation, HDTOptions spec) {
 		return PipedCopyIteratorUnordered.createUnorderedOfCallback(pipe -> parser.doParse(stream, baseUri, notation,
-				keepBNode, (triple, pos) -> pipe.addElement(triple.tripleToString())));
+				keepBNode, (triple, pos) -> pipe.addElement(triple.tripleToString()), true));
 	}
 
 	/**
