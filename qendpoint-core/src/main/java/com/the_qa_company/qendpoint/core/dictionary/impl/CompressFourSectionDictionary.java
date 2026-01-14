@@ -267,11 +267,35 @@ public class CompressFourSectionDictionary implements TempDictionary {
 	public interface NodeConsumer {
 		void onSubject(long preMapId, long newMapId);
 
+		default void onSubject(long[] preMapIds, long[] newMapIds, int offset, int length) {
+			for (int i = offset; i < offset + length; i++) {
+				onSubject(preMapIds[i], newMapIds[i]);
+			}
+		}
+
 		void onPredicate(long preMapId, long newMapId);
+
+		default void onPredicate(long[] preMapIds, long[] newMapIds, int offset, int length) {
+			for (int i = offset; i < offset + length; i++) {
+				onPredicate(preMapIds[i], newMapIds[i]);
+			}
+		}
 
 		void onObject(long preMapId, long newMapId);
 
+		default void onObject(long[] preMapIds, long[] newMapIds, int offset, int length) {
+			for (int i = offset; i < offset + length; i++) {
+				onObject(preMapIds[i], newMapIds[i]);
+			}
+		}
+
 		void onGraph(long preMapId, long newMapId);
+
+		default void onGraph(long[] preMapIds, long[] newMapIds, int offset, int length) {
+			for (int i = offset; i < offset + length; i++) {
+				onGraph(preMapIds[i], newMapIds[i]);
+			}
+		}
 	}
 
 	private interface NodeConsumerMethod {

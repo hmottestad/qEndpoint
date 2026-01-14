@@ -8,6 +8,7 @@ import com.the_qa_company.qendpoint.core.enums.TripleComponentOrder;
 import com.the_qa_company.qendpoint.core.exceptions.ParserException;
 import com.the_qa_company.qendpoint.core.hdt.HDT;
 import com.the_qa_company.qendpoint.core.hdt.HDTVocabulary;
+import com.the_qa_company.qendpoint.core.hdt.impl.diskimport.BucketedTripleMapper;
 import com.the_qa_company.qendpoint.core.hdt.impl.diskimport.CompressTripleMapper;
 import com.the_qa_company.qendpoint.core.hdt.impl.diskimport.CompressionResult;
 import com.the_qa_company.qendpoint.core.hdt.impl.diskimport.MapOnCallHDT;
@@ -44,6 +45,9 @@ import java.util.Iterator;
  * @author Antoine Willerval
  */
 public class HDTDiskImporter implements Closeable {
+	private static final int BUCKET_SIZE = 16 * 1024 * 1024;
+	private static final int BUCKET_BUFFER_RECORDS = 1024 * 1024;
+
 	/**
 	 * @return ram on the system
 	 */
@@ -207,14 +211,32 @@ public class HDTDiskImporter implements Closeable {
 		profiler.pushSection("dictionary write");
 		// create sections and triple mapping
 		DictionaryPrivate dictionary = hdt.getDictionary();
-		CompressTripleMapper mapper = new CompressTripleMapper(basePath, compressionResult.getTripleCount(), chunkSize,
-				compressionResult.supportsGraph(),
-				compressionResult.supportsGraph() ? compressionResult.getGraphCount() : 0);
-		try (CompressFourSectionDictionary modifiableDictionary = new CompressFourSectionDictionary(compressionResult,
-				mapper, listener, debugHDTBuilding, compressionResult.supportsGraph())) {
-			dictionary.loadAsync(modifiableDictionary, listener);
-		} catch (InterruptedException e) {
-			throw new ParserException(e);
+		CompressTripleMapper mapper;
+		if (hdtFormat.getBoolean(HDTOptionsKeys.LOADER_DISK_BUCKETED_MAPPING_KEY, true)) {
+			try (BucketedTripleMapper bucketedMapper = new BucketedTripleMapper(basePath.resolve("bucketedMapping"),
+					compressionResult.getTripleCount(), compressionResult.supportsGraph(), BUCKET_SIZE,
+					BUCKET_BUFFER_RECORDS);
+					CompressFourSectionDictionary modifiableDictionary = new CompressFourSectionDictionary(
+							compressionResult, bucketedMapper, listener, debugHDTBuilding,
+							compressionResult.supportsGraph())) {
+				dictionary.loadAsync(modifiableDictionary, listener);
+				mapper = new CompressTripleMapper(basePath, compressionResult.getTripleCount(), chunkSize,
+						compressionResult.supportsGraph(),
+						compressionResult.supportsGraph() ? compressionResult.getGraphCount() : 0);
+				bucketedMapper.materializeTo(mapper, listener);
+			} catch (InterruptedException e) {
+				throw new ParserException(e);
+			}
+		} else {
+			mapper = new CompressTripleMapper(basePath, compressionResult.getTripleCount(), chunkSize,
+					compressionResult.supportsGraph(),
+					compressionResult.supportsGraph() ? compressionResult.getGraphCount() : 0);
+			try (CompressFourSectionDictionary modifiableDictionary = new CompressFourSectionDictionary(
+					compressionResult, mapper, listener, debugHDTBuilding, compressionResult.supportsGraph())) {
+				dictionary.loadAsync(modifiableDictionary, listener);
+			} catch (InterruptedException e) {
+				throw new ParserException(e);
+			}
 		}
 		profiler.popSection();
 

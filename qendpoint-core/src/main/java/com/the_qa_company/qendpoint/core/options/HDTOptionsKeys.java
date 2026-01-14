@@ -105,6 +105,15 @@ public class HDTOptionsKeys {
 	@Key(type = Key.Type.BOOLEAN, desc = "specify that the method doesn't have to copy the triple strings between 2 calls to the iterator")
 	public static final String LOADER_DISK_NO_COPY_ITERATOR_KEY = "loader.disk.noCopyIterator";
 
+	/**
+	 * Enables a disk-import mapping strategy that avoids tripleId-indexed
+	 * random writes during dictionary construction by routing mapping updates
+	 * into tripleId-range buckets and materializing the final mapping files
+	 * sequentially.
+	 */
+	@Key(type = Key.Type.BOOLEAN, desc = "Enable bucketed mapping (avoid random mmapped writes) during disk import")
+	public static final String LOADER_DISK_BUCKETED_MAPPING_KEY = "loader.disk.bucketedMapping";
+
 	@Key(type = Key.Type.STRING, desc = "Compression algorithm used to reduce disk based algorithm, default none")
 	public static final String DISK_COMPRESSION_KEY = "disk.compression";
 
