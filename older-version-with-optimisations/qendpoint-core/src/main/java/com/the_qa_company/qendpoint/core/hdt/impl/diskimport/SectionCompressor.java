@@ -1,0 +1,739 @@
+package com.the_qa_company.qendpoint.core.hdt.impl.diskimport;
+
+import com.the_qa_company.qendpoint.core.enums.CompressionType;
+import com.the_qa_company.qendpoint.core.listener.MultiThreadListener;
+import com.the_qa_company.qendpoint.core.triples.IndexedNode;
+import com.the_qa_company.qendpoint.core.triples.TripleString;
+import com.the_qa_company.qendpoint.core.util.ParallelSortableArrayList;
+import com.the_qa_company.qendpoint.core.util.io.compress.CompressNodeReader;
+import com.the_qa_company.qendpoint.core.util.io.compress.CompressUtil;
+import com.the_qa_company.qendpoint.core.iterator.utils.AsyncIteratorFetcher;
+import com.the_qa_company.qendpoint.core.iterator.utils.LoserTreeMergeExceptionIterator;
+import com.the_qa_company.qendpoint.core.iterator.utils.SizeFetcher;
+import com.the_qa_company.qendpoint.core.iterator.utils.SizedSupplier;
+import com.the_qa_company.qendpoint.core.util.concurrent.ExceptionFunction;
+import com.the_qa_company.qendpoint.core.util.concurrent.ExceptionSupplier;
+import com.the_qa_company.qendpoint.core.util.concurrent.ExceptionThread;
+import com.the_qa_company.qendpoint.core.util.concurrent.KWayMerger;
+import com.the_qa_company.qendpoint.core.util.concurrent.KWayMergerChunked;
+import com.the_qa_company.qendpoint.core.util.io.CloseSuppressPath;
+import com.the_qa_company.qendpoint.core.util.io.IOUtil;
+import com.the_qa_company.qendpoint.core.util.listener.IntermediateListener;
+import com.the_qa_company.qendpoint.core.util.string.ByteString;
+import com.the_qa_company.qendpoint.core.util.string.CompactString;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.Closeable;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
+import java.util.function.Supplier;
+
+/**
+ * Tree worker object to compress the section of a triple stream into 3 sections
+ * (SPO) and a compress triple file
+ *
+ * @author Antoine Willerval
+ */
+public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString, SizedSupplier<TripleString>>,
+		KWayMergerChunked.KWayMergerChunkedImpl<TripleString, SizedSupplier<TripleString>> {
+	private static final Logger log = LoggerFactory.getLogger(SectionCompressor.class);
+
+	private final CloseSuppressPath baseFileName;
+	private final AsyncIteratorFetcher<TripleString> source; // may be null in
+																// pull-mode
+	private final MultiThreadListener listener;
+	private final AtomicLong triples = new AtomicLong();
+	private final AtomicLong ntRawSize = new AtomicLong();
+	private final int bufferSize;
+	private final long chunkSize;
+	private final int k;
+	private final int maxConcurrentMerges;
+	private final boolean debugSleepKwayDict;
+	private final boolean quads;
+	private final long start = System.currentTimeMillis();
+	private final CompressionType compressionType;
+
+	public SectionCompressor(CloseSuppressPath baseFileName, AsyncIteratorFetcher<TripleString> source,
+			MultiThreadListener listener, int bufferSize, long chunkSize, int k, boolean debugSleepKwayDict,
+			boolean quads, CompressionType compressionType) {
+		this(baseFileName, source, listener, bufferSize, chunkSize, k, debugSleepKwayDict, quads, compressionType,
+				Integer.MAX_VALUE);
+	}
+
+	public SectionCompressor(CloseSuppressPath baseFileName, AsyncIteratorFetcher<TripleString> source,
+			MultiThreadListener listener, int bufferSize, long chunkSize, int k, boolean debugSleepKwayDict,
+			boolean quads, CompressionType compressionType, int maxConcurrentMerges) {
+		this.source = source;
+		this.listener = listener;
+		this.baseFileName = baseFileName;
+		this.bufferSize = bufferSize;
+		this.chunkSize = chunkSize;
+		this.k = k;
+		this.maxConcurrentMerges = maxConcurrentMerges <= 0 ? Integer.MAX_VALUE : maxConcurrentMerges;
+		this.debugSleepKwayDict = debugSleepKwayDict;
+		this.quads = quads;
+		this.compressionType = compressionType;
+	}
+
+	public SectionCompressor(CloseSuppressPath baseFileName, MultiThreadListener listener, int bufferSize,
+			long chunkSize, int k, boolean debugSleepKwayDict, boolean quads, CompressionType compressionType) {
+		this(baseFileName, null, listener, bufferSize, chunkSize, k, debugSleepKwayDict, quads, compressionType,
+				Integer.MAX_VALUE);
+	}
+
+	public SectionCompressor(CloseSuppressPath baseFileName, MultiThreadListener listener, int bufferSize,
+			long chunkSize, int k, boolean debugSleepKwayDict, boolean quads, CompressionType compressionType,
+			int maxConcurrentMerges) {
+		this(baseFileName, null, listener, bufferSize, chunkSize, k, debugSleepKwayDict, quads, compressionType,
+				maxConcurrentMerges);
+	}
+
+	/*
+	 * FIXME: create a factory and override these methods with the hdt spec
+	 */
+
+	/**
+	 * mapping method for the subject of the triple. This method must return an
+	 * independent immutable {@link ByteString}. If the input is already an
+	 * immutable {@link ByteString}, it may be returned as-is.
+	 *
+	 * @param seq the subject (before)
+	 * @return the subject mapped
+	 */
+	protected ByteString convertSubject(CharSequence seq) {
+		if (seq instanceof CompactString cs) {
+			return cs;
+		}
+		if (seq instanceof ByteString bs) {
+			return new CompactString(bs);
+		}
+		return new CompactString(seq);
+	}
+
+	/**
+	 * mapping method for the predicate of the triple. This method must return
+	 * an independent immutable {@link ByteString}. If the input is already an
+	 * immutable {@link ByteString}, it may be returned as-is.
+	 *
+	 * @param seq the predicate (before)
+	 * @return the predicate mapped
+	 */
+	protected ByteString convertPredicate(CharSequence seq) {
+		if (seq instanceof CompactString cs) {
+			return cs;
+		}
+		if (seq instanceof ByteString bs) {
+			return new CompactString(bs);
+		}
+		return new CompactString(seq);
+	}
+
+	/**
+	 * mapping method for the graph of the triple. This method must return an
+	 * independent immutable {@link ByteString}. If the input is already an
+	 * immutable {@link ByteString}, it may be returned as-is.
+	 *
+	 * @param seq the graph (before)
+	 * @return the graph mapped
+	 */
+	protected ByteString convertGraph(CharSequence seq) {
+		if (seq instanceof CompactString cs) {
+			return cs;
+		}
+		if (seq instanceof ByteString bs) {
+			return new CompactString(bs);
+		}
+		return new CompactString(seq);
+	}
+
+	/**
+	 * mapping method for the object of the triple. This method must return an
+	 * independent immutable {@link ByteString}. If the input is already an
+	 * immutable {@link ByteString}, it may be returned as-is.
+	 *
+	 * @param seq the object (before)
+	 * @return the object mapped
+	 */
+	protected ByteString convertObject(CharSequence seq) {
+		if (seq instanceof CompactString cs) {
+			return cs;
+		}
+		if (seq instanceof ByteString bs) {
+			return new CompactString(bs);
+		}
+		return new CompactString(seq);
+	}
+
+	/**
+	 * Compress the stream into complete pre-sections files
+	 *
+	 * @param workers the number of workers
+	 * @return compression result
+	 * @throws IOException                    io exception
+	 * @throws InterruptedException           if the thread is interrupted
+	 * @throws KWayMerger.KWayMergerException exception with the tree working
+	 * @see #compressPartial()
+	 * @see #compress(int, String)
+	 */
+	public CompressionResult compressToFile(int workers)
+			throws IOException, InterruptedException, KWayMerger.KWayMergerException {
+		if (source == null) {
+			throw new IllegalStateException(
+					"compressToFile(workers) requires a source; use compressPull(...) instead.");
+		}
+		// force to create the first file
+		int workerThreads = Math.max(1, workers - 1);
+		int mergeLimit = Math.min(workerThreads, maxConcurrentMerges);
+		KWayMerger<TripleString, SizedSupplier<TripleString>> merger = new KWayMerger<>(baseFileName, source, this,
+				workerThreads, k, mergeLimit);
+		merger.start();
+		// wait for the workers to merge the sections and create the triples
+		Optional<CloseSuppressPath> sections = merger.waitResult();
+		if (sections.isEmpty()) {
+			return new CompressionResultEmpty(supportsGraph());
+		}
+		return new CompressionResultFile(triples.get(), ntRawSize.get(), new TripleFile(sections.get(), false),
+				supportsGraph());
+	}
+
+	/**
+	 * Compress the stream into multiple pre-sections files and merge them on
+	 * the fly
+	 *
+	 * @return compression result
+	 * @throws IOException io exception
+	 * @see #compressToFile(int)
+	 * @see #compress(int, String)
+	 */
+	public CompressionResult compressPartial() throws IOException, KWayMerger.KWayMergerException {
+		if (source == null) {
+			throw new IllegalStateException("compressPartial() requires a source; use compressPull(...) instead.");
+		}
+		List<TripleFile> files = new ArrayList<>();
+		baseFileName.closeWithDeleteRecurse();
+		try {
+			baseFileName.mkdirs();
+			long fileName = 0;
+			while (!source.isEnd()) {
+				TripleFile file = new TripleFile(baseFileName.resolve("chunk#" + fileName++), true);
+				createChunk(newStopFlux(source), file.root);
+				files.add(file);
+			}
+		} catch (Throwable e) {
+			try {
+				throw e;
+			} finally {
+				try {
+					IOUtil.closeAll(files);
+				} finally {
+					baseFileName.close();
+				}
+			}
+		}
+		return new CompressionResultPartial(files, triples.get(), ntRawSize.get(), supportsGraph());
+	}
+
+	/**
+	 * compress the sections/triples with a particular mode
+	 *
+	 * @param workers the worker required
+	 * @param mode    the mode to compress, can be
+	 *                {@link CompressionResult#COMPRESSION_MODE_COMPLETE}
+	 *                (default),
+	 *                {@link CompressionResult#COMPRESSION_MODE_PARTIAL} or
+	 *                null/"" for default
+	 * @return the compression result
+	 * @throws KWayMerger.KWayMergerException tree working exception
+	 * @throws IOException                    io exception
+	 * @throws InterruptedException           thread interruption
+	 * @see #compressToFile(int)
+	 * @see #compressPartial()
+	 */
+	public CompressionResult compress(int workers, String mode)
+			throws KWayMerger.KWayMergerException, IOException, InterruptedException {
+		if (mode == null) {
+			mode = "";
+		}
+		return switch (mode) {
+		case "", CompressionResult.COMPRESSION_MODE_COMPLETE -> compressToFile(workers);
+		case CompressionResult.COMPRESSION_MODE_PARTIAL -> compressPartial();
+		default -> throw new IllegalArgumentException("Unknown compression mode: " + mode);
+		};
+	}
+
+	@Override
+	public void createChunk(SizedSupplier<TripleString> fetcher, CloseSuppressPath output)
+			throws KWayMerger.KWayMergerException {
+
+		listener.notifyProgress(0, "start reading triples");
+
+		ParallelSortableArrayList<IndexedNode> subjects = new ParallelSortableArrayList<>(IndexedNode[].class);
+		ParallelSortableArrayList<IndexedNode> predicates = new ParallelSortableArrayList<>(IndexedNode[].class);
+		ParallelSortableArrayList<IndexedNode> objects = new ParallelSortableArrayList<>(IndexedNode[].class);
+		ParallelSortableArrayList<IndexedNode> graph;
+		if (supportsGraph()) {
+			graph = new ParallelSortableArrayList<>(IndexedNode[].class);
+		} else {
+			graph = null;
+		}
+
+		listener.notifyProgress(10, "reading triples {}", triples.get());
+		TripleString next;
+		while ((next = fetcher.get()) != null) {
+
+			if (debugSleepKwayDict) {
+				try {
+					Thread.sleep(25);
+				} catch (InterruptedException e) {
+					throw new RuntimeException(e);
+				}
+			}
+
+			// load the map triple and write it in the writer
+			long tripleID = triples.incrementAndGet();
+
+			// get indexed mapped char sequence
+			IndexedNode subjectNode = new IndexedNode(convertSubject(next.getSubject()), tripleID);
+			subjects.add(subjectNode);
+
+			// get indexed mapped char sequence
+			IndexedNode predicateNode = new IndexedNode(convertPredicate(next.getPredicate()), tripleID);
+			predicates.add(predicateNode);
+
+			// get indexed mapped char sequence
+			IndexedNode objectNode = new IndexedNode(convertObject(next.getObject()), tripleID);
+			objects.add(objectNode);
+
+			if (graph != null) {
+				IndexedNode graphNode = new IndexedNode(convertGraph(next.getGraph()), tripleID);
+				graph.add(graphNode);
+			}
+
+			if (tripleID % 100_000 == 0) {
+				// use start to measure how many triples are read per second
+				int triplesPerSecond = (int) (tripleID / ((System.currentTimeMillis() - start) / 1000.0));
+
+				listener.notifyProgress(10, "reading triples {} triples per second: {}", tripleID, triplesPerSecond);
+			}
+			// too much ram allowed?
+			if (subjects.size() == Integer.MAX_VALUE - 6) {
+				break;
+			}
+		}
+
+		ntRawSize.addAndGet(fetcher.getSize());
+
+		try {
+			TripleFile sections = new TripleFile(output, true);
+			try {
+				float split = 40.0f / (3 + (graph != null ? 1 : 0));
+				float range = 70;
+				IntermediateListener il = new IntermediateListener(listener);
+				il.setRange(range, range + split);
+				range += split;
+				il.setPrefix("creating subjects section " + sections.root.getFileName() + ": ");
+				il.notifyProgress(0, "sorting");
+				try (OutputStream stream = sections.openWSubject()) {
+					subjects.parallelSort(IndexedNode::compareTo);
+					CompressUtil.writeCompressedSection(subjects, stream, il);
+				}
+				il.setRange(range, range + split);
+				range += split;
+				il.setPrefix("creating predicates section " + sections.root.getFileName() + ": ");
+				il.notifyProgress(0, "sorting");
+				try (OutputStream stream = sections.openWPredicate()) {
+					predicates.parallelSort(IndexedNode::compareTo);
+					CompressUtil.writeCompressedSection(predicates, stream, il);
+				}
+				il.setRange(range, range + split);
+				range += split;
+				il.setPrefix("creating objects section " + sections.root.getFileName() + ": ");
+				il.notifyProgress(0, "sorting");
+				try (OutputStream stream = sections.openWObject()) {
+					objects.parallelSort(IndexedNode::compareTo);
+					CompressUtil.writeCompressedSection(objects, stream, il);
+				}
+				if (graph != null) {
+					il.setRange(range, range + split);
+					il.setPrefix("creating graph section " + sections.root.getFileName() + ": ");
+					il.notifyProgress(0, "sorting");
+					try (OutputStream stream = sections.openWGraph()) {
+						graph.parallelSort(IndexedNode::compareTo);
+						CompressUtil.writeCompressedSection(graph, stream, il);
+					}
+				}
+			} finally {
+				subjects.clear();
+				predicates.clear();
+				objects.clear();
+				listener.notifyProgress(100, "section completed{}", sections.root.getFileName());
+			}
+		} catch (IOException e) {
+			throw new KWayMerger.KWayMergerException(e);
+		}
+	}
+
+	@Override
+	public void mergeChunks(List<CloseSuppressPath> inputs, CloseSuppressPath output)
+			throws KWayMerger.KWayMergerException {
+		TripleFile sections;
+		try {
+			sections = new TripleFile(output, true);
+			List<TripleFile> tripleFiles = new ArrayList<>();
+			for (CloseSuppressPath in : inputs) {
+				tripleFiles.add(new TripleFile(in, false));
+			}
+			sections.compute(tripleFiles, false);
+			listener.notifyProgress(100, "sections merged {}", sections.root.getFileName());
+		} catch (IOException | InterruptedException e) {
+			throw new KWayMerger.KWayMergerException(e);
+		}
+	}
+
+	@Override
+	public SizedSupplier<TripleString> newStopFlux(Supplier<TripleString> flux) {
+		return SizeFetcher.ofTripleString(flux, chunkSize);
+	}
+
+	public CompressionResult compressPull(int workers, String mode,
+			ExceptionSupplier<SizedSupplier<TripleString>, IOException> chunkSupplier)
+			throws KWayMerger.KWayMergerException, IOException, InterruptedException {
+		if (mode == null) {
+			mode = "";
+		}
+
+		return switch (mode) {
+		case "", CompressionResult.COMPRESSION_MODE_COMPLETE -> compressToFilePull(workers, chunkSupplier);
+		case CompressionResult.COMPRESSION_MODE_PARTIAL -> compressPartialPull(chunkSupplier);
+		default -> throw new IllegalArgumentException("Unknown compression mode: " + mode);
+		};
+	}
+
+	public CompressionResult compressToFilePull(int workers,
+			ExceptionSupplier<SizedSupplier<TripleString>, IOException> chunkSupplier)
+			throws IOException, InterruptedException, KWayMerger.KWayMergerException {
+		int workerThreads = Math.max(1, workers - 1);
+		int mergeLimit = Math.min(workerThreads, maxConcurrentMerges);
+		KWayMergerChunked<TripleString, SizedSupplier<TripleString>> merger = new KWayMergerChunked<>(baseFileName,
+				chunkSupplier, this, workerThreads, k, mergeLimit);
+
+		merger.start();
+		Optional<CloseSuppressPath> sections = merger.waitResult();
+		if (sections.isEmpty()) {
+			return new CompressionResultEmpty(supportsGraph());
+		}
+		return new CompressionResultFile(triples.get(), ntRawSize.get(), new TripleFile(sections.get(), false),
+				supportsGraph());
+	}
+
+	public CompressionResult compressPartialPull(
+			ExceptionSupplier<SizedSupplier<TripleString>, IOException> chunkSupplier)
+			throws IOException, KWayMerger.KWayMergerException {
+		List<TripleFile> files = new ArrayList<>();
+		baseFileName.closeWithDeleteRecurse();
+
+		try {
+			baseFileName.mkdirs();
+			long fileName = 0;
+
+			while (true) {
+				SizedSupplier<TripleString> chunk = chunkSupplier.get();
+				if (chunk == null) {
+					break;
+				}
+
+				TripleFile file = new TripleFile(baseFileName.resolve("chunk#" + fileName++), true);
+				createChunk(chunk, file.root);
+				files.add(file);
+			}
+		} catch (Throwable e) {
+			try {
+				throw e;
+			} finally {
+				try {
+					IOUtil.closeAll(files);
+				} finally {
+					baseFileName.close();
+				}
+			}
+		}
+		return new CompressionResultPartial(files, triples.get(), ntRawSize.get(), supportsGraph());
+	}
+
+	/**
+	 * @return if this compressor is compressing graphs
+	 */
+	protected boolean supportsGraph() {
+		return quads;
+	}
+
+	/**
+	 * A triple directory, contains 3 files, subject, predicate and object
+	 *
+	 * @author Antoine Willerval
+	 */
+	public class TripleFile implements Closeable {
+		private final CloseSuppressPath root;
+		private final CloseSuppressPath s;
+		private final CloseSuppressPath p;
+		private final CloseSuppressPath o;
+		private final CloseSuppressPath g;
+
+		private TripleFile(CloseSuppressPath root, boolean mkdir) throws IOException {
+			this.root = root;
+			this.s = root.resolve("subject");
+			this.p = root.resolve("predicate");
+			this.o = root.resolve("object");
+			this.g = root.resolve("graph");
+
+			root.closeWithDeleteRecurse();
+			if (mkdir) {
+				root.mkdirs();
+			}
+		}
+
+		@Override
+		public void close() throws IOException {
+			delete();
+		}
+
+		public void delete() throws IOException {
+			root.close();
+		}
+
+		/**
+		 * @return open a write stream to the subject file
+		 * @throws IOException can't open the stream
+		 */
+		public OutputStream openWSubject() throws IOException {
+			return compressionType.compress(s.openOutputStream(bufferSize));
+		}
+
+		/**
+		 * @return open a write stream to the predicate file
+		 * @throws IOException can't open the stream
+		 */
+		public OutputStream openWPredicate() throws IOException {
+			return compressionType.compress(p.openOutputStream(bufferSize));
+		}
+
+		/**
+		 * @return open a write stream to the object file
+		 * @throws IOException can't open the stream
+		 */
+		public OutputStream openWObject() throws IOException {
+			return compressionType.compress(o.openOutputStream(bufferSize));
+		}
+
+		/**
+		 * @return open a write stream to the graph file
+		 * @throws IOException can't open the stream
+		 */
+		public OutputStream openWGraph() throws IOException {
+			return compressionType.compress(g.openOutputStream(bufferSize));
+		}
+
+		/**
+		 * @return open a read stream to the subject file
+		 * @throws IOException can't open the stream
+		 */
+		public InputStream openRSubject() throws IOException {
+			return compressionType.decompress(s.openInputStream(bufferSize));
+		}
+
+		/**
+		 * @return open a read stream to the predicate file
+		 * @throws IOException can't open the stream
+		 */
+		public InputStream openRPredicate() throws IOException {
+			return compressionType.decompress(p.openInputStream(bufferSize));
+		}
+
+		/**
+		 * @return open a read stream to the object file
+		 * @throws IOException can't open the stream
+		 */
+		public InputStream openRObject() throws IOException {
+			return compressionType.decompress(o.openInputStream(bufferSize));
+		}
+
+		/**
+		 * @return open a read stream to the graph file
+		 * @throws IOException can't open the stream
+		 */
+		public InputStream openRGraph() throws IOException {
+			return compressionType.decompress(g.openInputStream(bufferSize));
+		}
+
+		/**
+		 * @return the path to the subject file
+		 */
+		public CloseSuppressPath getSubjectPath() {
+			return s;
+		}
+
+		/**
+		 * @return the path to the predicate file
+		 */
+		public CloseSuppressPath getPredicatePath() {
+			return p;
+		}
+
+		/**
+		 * @return the path to the object file
+		 */
+		public CloseSuppressPath getObjectPath() {
+			return o;
+		}
+
+		/**
+		 * @return the path to the graph file
+		 */
+		public CloseSuppressPath getGraphPath() {
+			return g;
+		}
+
+		/**
+		 * compute this triple file from multiple triples files
+		 *
+		 * @param triples triples files container
+		 * @param async   if the method should load all the files asynchronously
+		 *                or not
+		 * @throws IOException          io exception while reading/writing
+		 * @throws InterruptedException interruption while waiting for the async
+		 *                              thread
+		 */
+
+		ExecutorService executorService = Executors.newVirtualThreadPerTaskExecutor();
+
+		public void compute(List<TripleFile> triples, boolean async) throws IOException, InterruptedException {
+			if (!async) {
+
+				Future<?> subjectFuture = executorService.submit(() -> {
+					try {
+						computeSubject(triples, false);
+					} catch (IOException e) {
+						throw new RuntimeException(e);
+					}
+				});
+				Future<?> predicateFuture = executorService.submit(() -> {
+					try {
+						computePredicate(triples, false);
+					} catch (IOException e) {
+						throw new RuntimeException(e);
+					}
+				});
+				Future<?> objectFuture = executorService.submit(() -> {
+					try {
+						computeObject(triples, false);
+					} catch (IOException e) {
+						throw new RuntimeException(e);
+					}
+				});
+				Future<?> graphFuture = null;
+				if (supportsGraph()) {
+					graphFuture = executorService.submit(() -> {
+						try {
+							computeGraph(triples, false);
+						} catch (IOException e) {
+							throw new RuntimeException(e);
+						}
+					});
+				}
+
+				try {
+					subjectFuture.get();
+					predicateFuture.get();
+					objectFuture.get();
+					if (graphFuture != null) {
+						graphFuture.get();
+					}
+				} catch (ExecutionException e) {
+					throw new IOException(e);
+				}
+			} else {
+
+				ExceptionThread.async("SectionMerger" + root.getFileName(), () -> computeSubject(triples, true),
+						() -> computePredicate(triples, true), () -> computeObject(triples, true), () -> {
+							if (supportsGraph()) {
+								computeGraph(triples, true);
+							}
+						}).joinAndCrashIfRequired();
+			}
+		}
+
+		private void computeSubject(List<TripleFile> triples, boolean async) throws IOException {
+			computeSection(triples, "subject", 0, 33, this::openWSubject, TripleFile::openRSubject,
+					TripleFile::getSubjectPath, async);
+		}
+
+		private void computePredicate(List<TripleFile> triples, boolean async) throws IOException {
+			computeSection(triples, "predicate", 33, 66, this::openWPredicate, TripleFile::openRPredicate,
+					TripleFile::getPredicatePath, async);
+		}
+
+		private void computeObject(List<TripleFile> triples, boolean async) throws IOException {
+			computeSection(triples, "object", 66, 100, this::openWObject, TripleFile::openRObject,
+					TripleFile::getObjectPath, async);
+		}
+
+		private void computeGraph(List<TripleFile> triples, boolean async) throws IOException {
+			computeSection(triples, "graph", 66, 100, this::openWGraph, TripleFile::openRGraph,
+					TripleFile::getGraphPath, async);
+		}
+
+		private void computeSection(List<TripleFile> triples, String section, int start, int end,
+				ExceptionSupplier<OutputStream, IOException> openW,
+				ExceptionFunction<TripleFile, InputStream, IOException> openR,
+				Function<TripleFile, Closeable> fileDelete, boolean async) throws IOException {
+			IntermediateListener il = new IntermediateListener(listener);
+			if (async) {
+				listener.registerThread(Thread.currentThread().getName());
+			} else {
+				il.setRange(start, end);
+			}
+			il.setPrefix("merging " + section + " section " + root.getFileName() + ": ");
+			il.notifyProgress(0, "merging section");
+
+			// readers to create the merge tree
+			CompressNodeReader[] readers = new CompressNodeReader[triples.size()];
+			Closeable[] fileDeletes = new Closeable[triples.size()];
+			try {
+				long size = 0L;
+				for (int i = 0; i < triples.size(); i++) {
+					CompressNodeReader reader = new CompressNodeReader(openR.apply(triples.get(i)));
+					size += reader.getSize();
+					readers[i] = reader;
+					fileDeletes[i] = fileDelete.apply(triples.get(i));
+				}
+
+				// section
+				try (OutputStream output = openW.get()) {
+					CompressUtil.writeCompressedSection(LoserTreeMergeExceptionIterator.merge(List.of(readers)), size,
+							output, il);
+				}
+			} finally {
+				if (async) {
+					listener.unregisterThread(Thread.currentThread().getName());
+				}
+				try {
+					IOUtil.closeAll(readers);
+				} finally {
+					IOUtil.closeAll(fileDeletes);
+				}
+			}
+		}
+	}
+
+}
