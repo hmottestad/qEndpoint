@@ -8,6 +8,7 @@ import com.the_qa_company.qendpoint.core.listener.MultiThreadListener;
 public class MultiThreadListenerConsole implements MultiThreadListener {
 	private static final int BAR_SIZE = 10;
 	private static final String ERASE_LINE = "\r\033[K";
+	private static final long REFRESH_MILLIS = 100;
 
 	private static String goBackNLine(int line) {
 		return "\033[" + line + "A";
@@ -43,9 +44,14 @@ public class MultiThreadListenerConsole implements MultiThreadListener {
 		ALLOW_COLOR_SEQUENCE = System.console() != null && "true".equalsIgnoreCase(envC);
 	}
 
-	private final Map<String, String> threadMessages;
+	private final Map<String, ThreadState> threadMessages;
 	private final boolean color;
 	private int previous;
+
+	private static final class ThreadState {
+		private float level;
+		private String message;
+	}
 
 	public MultiThreadListenerConsole(boolean color) {
 		this(color, ALLOW_ASCII_SEQUENCE);
@@ -58,6 +64,26 @@ public class MultiThreadListenerConsole implements MultiThreadListener {
 		} else {
 			threadMessages = null;
 		}
+		if (threadMessages != null) {
+			startRenderThread();
+		}
+	}
+
+	private void startRenderThread() {
+		Thread thread = new Thread(() -> {
+			while (!Thread.currentThread().isInterrupted()) {
+				try {
+					Thread.sleep(REFRESH_MILLIS);
+					render();
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+					break;
+				}
+			}
+		});
+		thread.setDaemon(true);
+		thread.setName("MultiThreadListenerConsole");
+		thread.start();
 	}
 
 	public String color(int r, int g, int b) {
@@ -131,17 +157,15 @@ public class MultiThreadListenerConsole implements MultiThreadListener {
 			return;
 		}
 		threadMessages.remove(threadName);
-		threadMessages.put("debug", "size: " + threadMessages.size());
-		render();
+		putState("debug", 0, "size: " + threadMessages.size());
 	}
 
 	@Override
 	public synchronized void notifyProgress(String thread, float level, String message) {
-		String msg = colorReset() + progressBar(level) + colorReset() + " " + message;
 		if (threadMessages != null) {
-			threadMessages.put(thread, msg);
-			render();
+			putState(thread, level, message);
 		} else {
+			String msg = colorReset() + progressBar(level) + colorReset() + " " + message;
 			System.out.println(colorReset() + "[" + colorThread() + thread + colorReset() + "]" + msg);
 		}
 	}
@@ -150,7 +174,7 @@ public class MultiThreadListenerConsole implements MultiThreadListener {
 		render(line);
 	}
 
-	public void removeLast() {
+	public synchronized void removeLast() {
 		StringBuilder message = new StringBuilder();
 		if (previous != 0) {
 			for (int i = 0; i < previous; i++) {
@@ -164,8 +188,11 @@ public class MultiThreadListenerConsole implements MultiThreadListener {
 		render(null);
 	}
 
-	private void render(String ln) {
+	private synchronized void render(String ln) {
 		if (threadMessages == null) {
+			return;
+		}
+		if (threadMessages.isEmpty() && previous == 0 && ln == null) {
 			return;
 		}
 		StringBuilder message = new StringBuilder();
@@ -186,9 +213,10 @@ public class MultiThreadListenerConsole implements MultiThreadListener {
 		int maxThreadNameSize = threadMessages.keySet().stream().mapToInt(String::length).max().orElse(0) + 1;
 
 		// write each thread logs
-		threadMessages.forEach((thread, msg) -> message.append('\r').append(colorReset()).append("[")
+		threadMessages.forEach((thread, state) -> message.append('\r').append(colorReset()).append("[")
 				.append(colorThread()).append(thread).append(colorReset()).append("]").append(" ")
-				.append(".".repeat(maxThreadNameSize - thread.length())).append(" ").append(msg).append("\n"));
+				.append(".".repeat(maxThreadNameSize - thread.length())).append(" ").append(renderState(state))
+				.append("\n"));
 		// remove previous printing
 		int toRemove = previous - lines;
 		if (toRemove > 0) {
@@ -197,5 +225,20 @@ public class MultiThreadListenerConsole implements MultiThreadListener {
 		previous = lines;
 
 		System.out.print(message);
+	}
+
+	private void putState(String thread, float level, String message) {
+		ThreadState state = threadMessages.get(thread);
+		if (state == null) {
+			state = new ThreadState();
+			threadMessages.put(thread, state);
+		}
+		state.level = level;
+		state.message = message;
+	}
+
+	private String renderState(ThreadState state) {
+		String message = state.message == null ? "" : state.message;
+		return colorReset() + progressBar(state.level) + colorReset() + " " + message;
 	}
 }
