@@ -25,6 +25,7 @@ import java.util.List;
 
 import com.the_qa_company.qendpoint.core.quad.QuadString;
 import org.apache.jena.graph.Triple;
+import org.apache.jena.iri.impl.LexerFixer;
 import org.apache.jena.riot.Lang;
 import org.apache.jena.riot.RDFParser;
 import org.apache.jena.riot.lang.LabelToNode;
@@ -45,10 +46,20 @@ import org.slf4j.LoggerFactory;
 public class RDFParserRIOT implements RDFParserCallback {
 	private static final Logger log = LoggerFactory.getLogger(RDFParserRIOT.class);
 	private static final int CORES = Runtime.getRuntime().availableProcessors();
+	private static volatile boolean fixedLexer = false;
 
 	private void parse(InputStream stream, String baseUri, Lang lang, boolean keepBNode, ElemStringBuffer buffer,
 			boolean parallel) {
 		int workerStreams = Math.max(1, CORES - 1);
+
+		if (!fixedLexer) {
+			synchronized (RDFParserRIOT.class) {
+				if (!fixedLexer) {
+					LexerFixer.fixLexers();
+					fixedLexer = true;
+				}
+			}
+		}
 
 		if (parallel && (lang == Lang.TURTLE)) {
 			if (keepBNode) {
@@ -191,9 +202,9 @@ public class RDFParserRIOT implements RDFParserCallback {
 
 		@Override
 		public void processTriple(TripleString triple, long pos) {
-			synchronized (lock) {
-				delegate.processTriple(triple, pos);
-			}
+//			synchronized (lock) {
+			delegate.processTriple(triple, pos);
+//			}
 		}
 	}
 

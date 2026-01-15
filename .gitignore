@@ -59,3 +59,4 @@ wikidata
 qendpoint-store/wdbench-indexes
 wdbench-results
 .m2_repo
+/indexing/
