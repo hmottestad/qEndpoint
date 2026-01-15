@@ -9,7 +9,7 @@ import com.the_qa_company.qendpoint.core.iterator.utils.IndexNodeDeltaMergeExcep
 import com.the_qa_company.qendpoint.core.util.crc.CRC32;
 import com.the_qa_company.qendpoint.core.util.crc.CRC8;
 import com.the_qa_company.qendpoint.core.util.crc.CRCInputStream;
- import com.the_qa_company.qendpoint.core.util.io.CRCStopBitInputStream;
+import com.the_qa_company.qendpoint.core.util.io.CRCStopBitInputStream;
 import com.the_qa_company.qendpoint.core.util.string.ReplazableString;
 
 import java.io.Closeable;
