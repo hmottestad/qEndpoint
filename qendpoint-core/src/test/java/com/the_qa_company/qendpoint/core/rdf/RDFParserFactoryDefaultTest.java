@@ -1,4 +1,4 @@
- package com.the_qa_company.qendpoint.core.rdf;
+package com.the_qa_company.qendpoint.core.rdf;
 
 import com.the_qa_company.qendpoint.core.enums.RDFNotation;
 import com.the_qa_company.qendpoint.core.rdf.parsers.RDFParserSimple;

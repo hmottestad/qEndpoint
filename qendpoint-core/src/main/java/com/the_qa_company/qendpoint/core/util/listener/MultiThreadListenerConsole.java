@@ -1,7 +1,10 @@
 package com.the_qa_company.qendpoint.core.util.listener;
 
-import java.util.Map;
-import java.util.TreeMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import com.the_qa_company.qendpoint.core.listener.MultiThreadListener;
 
@@ -44,13 +47,16 @@ public class MultiThreadListenerConsole implements MultiThreadListener {
 		ALLOW_COLOR_SEQUENCE = System.console() != null && "true".equalsIgnoreCase(envC);
 	}
 
-	private final Map<String, ThreadState> threadMessages;
+	private final ConcurrentMap<String, ThreadState> threadMessages;
 	private final boolean color;
-	private int previous;
+	private final AtomicInteger previous = new AtomicInteger();
+	private final AtomicBoolean rendering = new AtomicBoolean(false);
+	private final AtomicBoolean clearRequested = new AtomicBoolean(false);
+	private final ConcurrentLinkedQueue<String> pendingLines = new ConcurrentLinkedQueue<>();
 
 	private static final class ThreadState {
-		private float level;
-		private String message;
+		private volatile float level;
+		private volatile String message;
 	}
 
 	public MultiThreadListenerConsole(boolean color) {
@@ -60,7 +66,7 @@ public class MultiThreadListenerConsole implements MultiThreadListener {
 	public MultiThreadListenerConsole(boolean color, boolean asciiListener) {
 		this.color = color || ALLOW_COLOR_SEQUENCE;
 		if (asciiListener) {
-			threadMessages = new TreeMap<>();
+			threadMessages = new ConcurrentSkipListMap<>();
 		} else {
 			threadMessages = null;
 		}
@@ -138,7 +144,7 @@ public class MultiThreadListenerConsole implements MultiThreadListener {
 	}
 
 	@Override
-	public synchronized void unregisterAllThreads() {
+	public void unregisterAllThreads() {
 		if (threadMessages == null) {
 			return;
 		}
@@ -147,12 +153,12 @@ public class MultiThreadListenerConsole implements MultiThreadListener {
 	}
 
 	@Override
-	public synchronized void registerThread(String threadName) {
+	public void registerThread(String threadName) {
 		notifyProgress(threadName, 0, "-");
 	}
 
 	@Override
-	public synchronized void unregisterThread(String threadName) {
+	public void unregisterThread(String threadName) {
 		if (threadMessages == null) {
 			return;
 		}
@@ -161,7 +167,7 @@ public class MultiThreadListenerConsole implements MultiThreadListener {
 	}
 
 	@Override
-	public synchronized void notifyProgress(String thread, float level, String message) {
+	public void notifyProgress(String thread, float level, String message) {
 		if (threadMessages != null) {
 			putState(thread, level, message);
 		} else {
@@ -170,69 +176,74 @@ public class MultiThreadListenerConsole implements MultiThreadListener {
 		}
 	}
 
-	public synchronized void printLine(String line) {
-		render(line);
+	public void printLine(String line) {
+		if (line != null) {
+			pendingLines.add(line);
+		}
+		render(null);
 	}
 
-	public synchronized void removeLast() {
-		StringBuilder message = new StringBuilder();
-		if (previous != 0) {
-			for (int i = 0; i < previous; i++) {
-				message.append(goBackNLine(1)).append(ERASE_LINE);
-			}
-		}
-		System.out.print(message);
+	public void removeLast() {
+		clearRequested.set(true);
+		render(null);
 	}
 
 	private void render() {
 		render(null);
 	}
 
-	private synchronized void render(String ln) {
+	private void render(String ln) {
 		if (threadMessages == null) {
 			return;
 		}
-		if (threadMessages.isEmpty() && previous == 0 && ln == null) {
+		if (ln != null) {
+			pendingLines.add(ln);
+		}
+		if (!rendering.compareAndSet(false, true)) {
 			return;
 		}
-		StringBuilder message = new StringBuilder();
-		int lines = threadMessages.size();
-		message.append("\r");
-		// go back each line of the thread message
-
-		if (previous != 0) {
-			for (int i = 0; i < previous; i++) {
-				message.append(goBackNLine(1)).append(ERASE_LINE);
+		try {
+			int previousLines = previous.get();
+			if (threadMessages.isEmpty() && previousLines == 0 && pendingLines.isEmpty() && !clearRequested.get()) {
+				return;
 			}
+			boolean clearOnly = clearRequested.getAndSet(false);
+			StringBuilder message = new StringBuilder();
+			message.append("\r");
+			if (previousLines != 0) {
+				for (int i = 0; i < previousLines; i++) {
+					message.append(goBackNLine(1)).append(ERASE_LINE);
+				}
+			}
+			if (clearOnly) {
+				previous.set(0);
+				System.out.print(message);
+				return;
+			}
+			String line;
+			while ((line = pendingLines.poll()) != null) {
+				message.append(line).append("\n");
+			}
+			int lines = threadMessages.size();
+			int maxThreadNameSize = threadMessages.keySet().stream().mapToInt(String::length).max().orElse(0) + 1;
+
+			threadMessages.forEach((thread, state) -> message.append('\r').append(colorReset()).append("[")
+					.append(colorThread()).append(thread).append(colorReset()).append("]").append(" ")
+					.append(".".repeat(maxThreadNameSize - thread.length())).append(" ").append(renderState(state))
+					.append("\n"));
+			int toRemove = previousLines - lines;
+			if (toRemove > 0) {
+				message.append((ERASE_LINE + "\n").repeat(toRemove)).append(goBackNLine(toRemove));
+			}
+			previous.set(lines);
+			System.out.print(message);
+		} finally {
+			rendering.set(false);
 		}
-
-		if (ln != null) {
-			message.append(ln).append("\n");
-		}
-
-		int maxThreadNameSize = threadMessages.keySet().stream().mapToInt(String::length).max().orElse(0) + 1;
-
-		// write each thread logs
-		threadMessages.forEach((thread, state) -> message.append('\r').append(colorReset()).append("[")
-				.append(colorThread()).append(thread).append(colorReset()).append("]").append(" ")
-				.append(".".repeat(maxThreadNameSize - thread.length())).append(" ").append(renderState(state))
-				.append("\n"));
-		// remove previous printing
-		int toRemove = previous - lines;
-		if (toRemove > 0) {
-			message.append((ERASE_LINE + "\n").repeat(toRemove)).append(goBackNLine(toRemove));
-		}
-		previous = lines;
-
-		System.out.print(message);
 	}
 
 	private void putState(String thread, float level, String message) {
-		ThreadState state = threadMessages.get(thread);
-		if (state == null) {
-			state = new ThreadState();
-			threadMessages.put(thread, state);
-		}
+		ThreadState state = threadMessages.computeIfAbsent(thread, key -> new ThreadState());
 		state.level = level;
 		state.message = message;
 	}
