@@ -291,7 +291,7 @@ public class HDTOptionsKeys {
 	public static final String PROFILER_ASYNC_OUTPUT_KEY = "profiler.async.output";
 	/**
 	 * Key for enabling the canonical NTriple file simple parser, default to
-	 * false. Boolean value
+	 * true. Boolean value
 	 */
 	@Key(type = Key.Type.BOOLEAN, desc = "Use the canonical NT file parser, removing checks")
 	public static final String NT_SIMPLE_PARSER_KEY = "parser.ntSimpleParser";

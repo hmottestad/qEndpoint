@@ -43,7 +43,7 @@ import java.io.InputStream;
  */
 public class RDFParserFactory {
 	public static boolean useSimple(HDTOptions options) {
-		return options != null && options.getBoolean(HDTOptionsKeys.NT_SIMPLE_PARSER_KEY, false);
+		return options != null && options.getBoolean(HDTOptionsKeys.NT_SIMPLE_PARSER_KEY, true);
 	}
 
 	public static RDFParserCallback getParserCallback(RDFNotation notation) {
