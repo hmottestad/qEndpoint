@@ -31,6 +31,10 @@ import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -610,11 +614,52 @@ public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString
 		 */
 		public void compute(List<TripleFile> triples, boolean async) throws IOException, InterruptedException {
 			if (!async) {
-				computeSubject(triples, false);
-				computePredicate(triples, false);
-				computeObject(triples, false);
-				if (supportsGraph()) {
-					computeGraph(triples, false);
+				int taskCount = supportsGraph() ? 4 : 3;
+				ExecutorService executorService = Executors.newFixedThreadPool(taskCount);
+				try {
+					Future<?> subjectFuture = executorService.submit(() -> {
+						computeSubject(triples, false);
+						return null;
+					});
+					Future<?> predicateFuture = executorService.submit(() -> {
+						computePredicate(triples, false);
+						return null;
+					});
+					Future<?> objectFuture = executorService.submit(() -> {
+						computeObject(triples, false);
+						return null;
+					});
+					Future<?> graphFuture = null;
+					if (supportsGraph()) {
+						graphFuture = executorService.submit(() -> {
+							computeGraph(triples, false);
+							return null;
+						});
+					}
+
+					subjectFuture.get();
+					predicateFuture.get();
+					objectFuture.get();
+					if (graphFuture != null) {
+						graphFuture.get();
+					}
+				} catch (InterruptedException e) {
+					executorService.shutdownNow();
+					Thread.currentThread().interrupt();
+					throw e;
+				} catch (ExecutionException e) {
+					executorService.shutdownNow();
+					Throwable cause = e.getCause();
+					if (cause instanceof IOException ioException) {
+						throw ioException;
+					}
+					if (cause instanceof RuntimeException runtimeException
+							&& runtimeException.getCause() instanceof IOException ioException) {
+						throw ioException;
+					}
+					throw new IOException(cause);
+				} finally {
+					executorService.shutdown();
 				}
 			} else {
 

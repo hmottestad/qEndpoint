@@ -339,7 +339,7 @@ public class MapCompressTripleMerger implements KWayMerger.KWayMergerImpl<Triple
 					long written = 0;
 					while (it.hasNext()) {
 						w.appendTriple(it.next());
-						if (count % block == 0) {
+						if (count % 16 * 1024 == 0) {
 							listener.notifyProgress(count / (block / 10f), "merging triples " + count + "/" + size);
 						}
 						count++;
