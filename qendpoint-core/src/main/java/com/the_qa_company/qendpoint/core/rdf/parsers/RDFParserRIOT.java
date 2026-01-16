@@ -172,11 +172,7 @@ public class RDFParserRIOT implements RDFParserCallback {
 	public void doParse(InputStream input, String baseUri, RDFNotation notation, boolean keepBNode,
 			RDFCallback callback, boolean parallel) throws ParserException {
 		try {
-			RDFCallback safeCallback = callback;
-			if (parallel && keepBNode) {
-				safeCallback = new SynchronizedCallback(callback);
-			}
-			ElemStringBuffer buffer = new ElemStringBuffer(safeCallback);
+			ElemStringBuffer buffer = new ElemStringBuffer(callback);
 			switch (notation) {
 			case NTRIPLES -> parse(input, baseUri, Lang.NTRIPLES, keepBNode, buffer, parallel);
 			case NQUAD -> parse(input, baseUri, Lang.NQUADS, keepBNode, buffer, parallel);
@@ -189,22 +185,6 @@ public class RDFParserRIOT implements RDFParserCallback {
 		} catch (Exception e) {
 			log.error("Unexpected exception.", e);
 			throw new ParserException(e);
-		}
-	}
-
-	private static final class SynchronizedCallback implements RDFCallback {
-		private final RDFCallback delegate;
-		private final Object lock = new Object();
-
-		private SynchronizedCallback(RDFCallback delegate) {
-			this.delegate = delegate;
-		}
-
-		@Override
-		public void processTriple(TripleString triple, long pos) {
-//			synchronized (lock) {
-			delegate.processTriple(triple, pos);
-//			}
 		}
 	}
 
