@@ -8,6 +8,7 @@ import com.the_qa_company.qendpoint.core.triples.TripleString;
 import com.the_qa_company.qendpoint.core.util.UnicodeEscape;
 import com.the_qa_company.qendpoint.core.util.concurrent.ExceptionSupplier;
 import com.the_qa_company.qendpoint.core.util.io.BigMappedByteBuffer;
+import com.the_qa_company.qendpoint.core.util.string.ByteStringInterner;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -37,6 +38,10 @@ public final class NTriplesChunkedSource
 	private static final byte LF = (byte) '\n';
 	private static final byte CR = (byte) '\r';
 	private static final byte BS = (byte) '\\';
+	private static final int DEFAULT_INTERN_ENTRIES = 4096;
+	private static final int MAX_INTERN_ENTRIES = 262_144;
+	private static final ThreadLocal<ByteStringInterner> SHARED_INTERNER = ThreadLocal
+			.withInitial(() -> new ByteStringInterner(DEFAULT_INTERN_ENTRIES, MAX_INTERN_ENTRIES));
 
 	private final boolean mmapMode;
 
@@ -49,6 +54,7 @@ public final class NTriplesChunkedSource
 	private final long fileSize;
 	private final AtomicLong nextOffset;
 	private final long probeStep;
+	private final int expectedInternerEntries;
 
 	private final boolean readQuad;
 	private final long chunkBudgetBytes;
@@ -88,6 +94,8 @@ public final class NTriplesChunkedSource
 		this.chunkBudgetBytes = chunkBudgetBytes;
 		this.maxBatchBytes = maxBatchBytes;
 		this.maxBatchLines = maxBatchLines;
+		this.expectedInternerEntries = Math.max(DEFAULT_INTERN_ENTRIES,
+				estimateInternerEntries(maxBatchLines, readQuad));
 		this.mmapMode = false;
 		this.mapped = null;
 		this.channel = null;
@@ -116,6 +124,8 @@ public final class NTriplesChunkedSource
 		this.maxBatchLines = 0;
 		this.nextOffset = new AtomicLong(0L);
 		this.probeStep = Math.max(1L, chunkBudgetBytes / 8L);
+		this.expectedInternerEntries = Math.max(DEFAULT_INTERN_ENTRIES,
+				estimateInternerEntries(estimateLineCount(chunkBudgetBytes), readQuad));
 
 		FileChannel ch = FileChannel.open(path, StandardOpenOption.READ);
 		BigMappedByteBuffer mappedBuffer;
@@ -187,6 +197,8 @@ public final class NTriplesChunkedSource
 
 	private final class Chunk implements SizedSupplier<TripleString> {
 		private final LineSliceBuffer lineBuffer;
+		private ByteStringInterner interner;
+		private TripleString.ComponentDecoderChars decoder;
 		private int idx;
 
 		private long remaining = chunkBudgetBytes;
@@ -213,6 +225,7 @@ public final class NTriplesChunkedSource
 
 			try {
 				while (true) {
+					ensureDecoder();
 					// Need more lines?
 					if (idx >= lineBuffer.count()) {
 						idx = 0;
@@ -234,13 +247,21 @@ public final class NTriplesChunkedSource
 					int start = lineBuffer.startAt(idx);
 					int endExclusive = lineBuffer.endAt(idx);
 					idx++;
-					if (parseLine(slab, start, endExclusive - 1, reusable, readQuad)) {
+					if (parseLine(slab, start, endExclusive - 1, reusable, readQuad, decoder)) {
 						return reusable;
 					}
 					// skip comments/blank/invalid lines, keep scanning
 				}
 			} catch (IOException ioe) {
 				throw new RuntimeException(ioe);
+			}
+		}
+
+		private void ensureDecoder() {
+			if (decoder == null) {
+				interner = SHARED_INTERNER.get();
+				interner.ensureCapacity(expectedInternerEntries);
+				decoder = (buffer, start, end) -> UnicodeEscape.unescapeByteString(buffer, start, end, interner);
 			}
 		}
 
@@ -277,6 +298,7 @@ public final class NTriplesChunkedSource
 	private final class MmapChunk implements SizedSupplier<TripleString> {
 		private final long end;
 		private final long size;
+		private ByteStringInterner interner;
 		private long cursor;
 		private boolean done;
 
@@ -294,6 +316,7 @@ public final class NTriplesChunkedSource
 				return null;
 			}
 
+			ensureInterner();
 			while (cursor < end) {
 				long lineStart = cursor;
 				long lineBreak = findNextLineBreak(mapped, lineStart, end);
@@ -316,7 +339,7 @@ public final class NTriplesChunkedSource
 					continue;
 				}
 
-				if (parseLine(mapped, lineStart, lineEndExclusive - 1, reusable, readQuad)) {
+				if (parseLine(mapped, lineStart, lineEndExclusive - 1, reusable, readQuad, interner)) {
 					return reusable;
 				}
 				// skip comments/blank/invalid lines, keep scanning
@@ -326,17 +349,40 @@ public final class NTriplesChunkedSource
 			return null;
 		}
 
+		private void ensureInterner() {
+			if (interner == null) {
+				interner = SHARED_INTERNER.get();
+				interner.ensureCapacity(expectedInternerEntries);
+			}
+		}
+
 		@Override
 		public long getSize() {
 			return size;
 		}
 	}
 
+	private static int estimateLineCount(long byteCount) {
+		if (byteCount <= 0) {
+			return 256;
+		}
+		long lines = byteCount / 64L;
+		long clamped = Math.max(256L, Math.min(65536L, lines));
+		return (int) clamped;
+	}
+
+	private static int estimateInternerEntries(long lineCount, boolean readQuad) {
+		long entries = lineCount * (readQuad ? 4L : 3L);
+		long clamped = Math.max(256L, Math.min(262144L, entries));
+		return (int) clamped;
+	}
+
 	/**
 	 * Mirrors {@link RDFParserSimple}'s whitespace trimming and comment
 	 * skipping.
 	 */
-	private static boolean parseLine(char[] buffer, int start, int endInclusive, TripleString out, boolean readQuad) {
+	private static boolean parseLine(char[] buffer, int start, int endInclusive, TripleString out, boolean readQuad,
+			TripleString.ComponentDecoderChars decoder) {
 		int s = start;
 		while (s <= endInclusive) {
 			char c = buffer[s];
@@ -363,7 +409,7 @@ public final class NTriplesChunkedSource
 		}
 
 		try {
-			out.readByteString(buffer, s, e, readQuad);
+			out.readByteString(buffer, s, e, readQuad, decoder);
 			if (!out.hasEmpty()) {
 				return true;
 			}
@@ -381,7 +427,7 @@ public final class NTriplesChunkedSource
 	}
 
 	private static boolean parseLine(BigMappedByteBuffer buffer, long start, long end, TripleString out,
-			boolean readQuad) {
+			boolean readQuad, ByteStringInterner interner) {
 		long s = start;
 		while (s <= end) {
 			byte b = byteAt(buffer, s);
@@ -408,7 +454,7 @@ public final class NTriplesChunkedSource
 		}
 
 		try {
-			readByteString(buffer, s, e, readQuad, out);
+			readByteString(buffer, s, e, readQuad, out, interner);
 			if (!out.hasEmpty()) {
 				return true;
 			}
@@ -426,7 +472,7 @@ public final class NTriplesChunkedSource
 	}
 
 	private static void readByteString(BigMappedByteBuffer buffer, long start, long endInclusive, boolean processQuad,
-			TripleString out) throws ParserException {
+			TripleString out, ByteStringInterner interner) throws ParserException {
 		long end = endInclusive + 1;
 		out.clear();
 
@@ -444,7 +490,7 @@ public final class NTriplesChunkedSource
 				posb--;
 			}
 		}
-		out.setSubject(UnicodeEscape.unescapeByteString(buffer, posa, posb));
+		out.setSubject(UnicodeEscape.unescapeByteString(buffer, posa, posb, interner));
 
 		posa = split + 1;
 		split = searchNextTabOrSpace(buffer, posa, end);
@@ -459,7 +505,7 @@ public final class NTriplesChunkedSource
 				posb--;
 			}
 		}
-		out.setPredicate(UnicodeEscape.unescapeByteString(buffer, posa, posb));
+		out.setPredicate(UnicodeEscape.unescapeByteString(buffer, posa, posb, interner));
 
 		posa = split + 1;
 		posb = end;
@@ -490,13 +536,13 @@ public final class NTriplesChunkedSource
 						throw new ParserException("end of a '>' without a start '<'");
 					}
 					if (posa != iriStart && iriStart > 0 && byteAt(buffer, iriStart - 1) != '^') {
-						out.setGraph(UnicodeEscape.unescapeByteString(buffer, iriStart + 1, posb - 1));
+						out.setGraph(UnicodeEscape.unescapeByteString(buffer, iriStart + 1, posb - 1, interner));
 						posb = iriStart - 1;
 					}
 				} else {
 					long bnodeStart = searchBNodeBackward(buffer, posa, posb);
 					if (bnodeStart > posa) {
-						out.setGraph(UnicodeEscape.unescapeByteString(buffer, bnodeStart + 1, posb));
+						out.setGraph(UnicodeEscape.unescapeByteString(buffer, bnodeStart + 1, posb, interner));
 						posb = bnodeStart;
 					}
 				}
@@ -509,7 +555,7 @@ public final class NTriplesChunkedSource
 				posb--;
 			}
 		}
-		out.setObject(UnicodeEscape.unescapeByteString(buffer, posa, posb));
+		out.setObject(UnicodeEscape.unescapeByteString(buffer, posa, posb, interner));
 	}
 
 	private static long searchNextTabOrSpace(BigMappedByteBuffer buffer, long start, long end) {

@@ -368,13 +368,18 @@ public class TripleString {
 		readImpl(buffer, start, end, processQuad, UnicodeEscape::unescapeByteString);
 	}
 
+	public void readByteString(char[] buffer, int start, int end, boolean processQuad, ComponentDecoderChars decoder)
+			throws ParserException {
+		readImpl(buffer, start, end, processQuad, decoder);
+	}
+
 	@FunctionalInterface
 	private interface ComponentDecoder {
 		CharSequence decode(String line, int start, int end);
 	}
 
 	@FunctionalInterface
-	private interface ComponentDecoderChars {
+	public interface ComponentDecoderChars {
 		CharSequence decode(char[] buffer, int start, int end);
 	}
 

@@ -2,6 +2,7 @@ package com.the_qa_company.qendpoint.core.util;
 
 import com.the_qa_company.qendpoint.core.util.io.BigMappedByteBuffer;
 import com.the_qa_company.qendpoint.core.util.string.ByteString;
+import com.the_qa_company.qendpoint.core.util.string.ByteStringInterner;
 import com.the_qa_company.qendpoint.core.util.string.CompactString;
 
 import java.io.IOException;
@@ -282,6 +283,23 @@ public class UnicodeEscape {
 		return new CompactString(out);
 	}
 
+	public static ByteString unescapeByteString(String s, int start, int end, ByteStringInterner interner) {
+		if (interner == null) {
+			return unescapeByteString(s, start, end);
+		}
+
+		int backSlashIdx = s.indexOf('\\', start);
+		if (backSlashIdx == -1 || backSlashIdx >= end) {
+			return utf8EncodeRange(s, start, end, interner);
+		}
+
+		int byteLen = utf8LengthAfterUnescape(s, start, end);
+		byte[] scratch = interner.ensureScratchCapacity(byteLen);
+		int written = writeUtf8AfterUnescape(s, start, end, scratch, 0);
+		assert written == byteLen;
+		return interner.internScratch(scratch, written);
+	}
+
 	/**
 	 * Unescapes an escaped Unicode string stored in a character buffer into a
 	 * {@link ByteString} without allocating an intermediate {@link String}.
@@ -303,6 +321,23 @@ public class UnicodeEscape {
 		int written = writeUtf8AfterUnescape(buffer, start, end, out, 0);
 		assert written == byteLen;
 		return new CompactString(out);
+	}
+
+	public static ByteString unescapeByteString(char[] buffer, int start, int end, ByteStringInterner interner) {
+		if (interner == null) {
+			return unescapeByteString(buffer, start, end);
+		}
+
+		int backSlashIdx = indexOf(buffer, start, end, '\\');
+		if (backSlashIdx == -1) {
+			return utf8EncodeRange(buffer, start, end, interner);
+		}
+
+		int byteLen = utf8LengthAfterUnescape(buffer, start, end);
+		byte[] scratch = interner.ensureScratchCapacity(byteLen);
+		int written = writeUtf8AfterUnescape(buffer, start, end, scratch, 0);
+		assert written == byteLen;
+		return interner.internScratch(scratch, written);
 	}
 
 	/**
@@ -337,6 +372,32 @@ public class UnicodeEscape {
 		return new CompactString(out);
 	}
 
+	public static ByteString unescapeByteString(BigMappedByteBuffer buffer, long start, long end,
+			ByteStringInterner interner) {
+		if (interner == null) {
+			return unescapeByteString(buffer, start, end);
+		}
+		if (start >= end) {
+			return ByteString.empty();
+		}
+
+		long backSlashIdx = indexOf(buffer, start, end, (byte) '\\');
+		if (backSlashIdx < 0) {
+			int len = Math.toIntExact(end - start);
+			byte[] scratch = interner.ensureScratchCapacity(len);
+			for (int i = 0; i < len; i++) {
+				scratch[i] = buffer.get(start + i);
+			}
+			return interner.internScratch(scratch, len);
+		}
+
+		int byteLen = utf8LengthAfterUnescape(buffer, start, end);
+		byte[] scratch = interner.ensureScratchCapacity(byteLen);
+		int written = writeUtf8AfterUnescape(buffer, start, end, scratch, 0);
+		assert written == byteLen;
+		return interner.internScratch(scratch, written);
+	}
+
 	private static ByteString utf8EncodeRange(String s, int start, int end) {
 		// Common case: ASCII-only
 		int len = end - start;
@@ -349,6 +410,19 @@ public class UnicodeEscape {
 			out[i] = (byte) c;
 		}
 		return new CompactString(out);
+	}
+
+	private static ByteString utf8EncodeRange(String s, int start, int end, ByteStringInterner interner) {
+		int len = end - start;
+		byte[] scratch = interner.ensureScratchCapacity(len);
+		for (int i = 0; i < len; i++) {
+			char c = s.charAt(start + i);
+			if (c >= 0x80) {
+				return utf8EncodeRangeSlow(s, start, end, interner);
+			}
+			scratch[i] = (byte) c;
+		}
+		return interner.internScratch(scratch, len);
 	}
 
 	private static ByteString utf8EncodeRange(char[] buffer, int start, int end) {
@@ -364,6 +438,19 @@ public class UnicodeEscape {
 		return new CompactString(out);
 	}
 
+	private static ByteString utf8EncodeRange(char[] buffer, int start, int end, ByteStringInterner interner) {
+		int len = end - start;
+		byte[] scratch = interner.ensureScratchCapacity(len);
+		for (int i = 0; i < len; i++) {
+			char c = buffer[start + i];
+			if (c >= 0x80) {
+				return utf8EncodeRangeSlow(buffer, start, end, interner);
+			}
+			scratch[i] = (byte) c;
+		}
+		return interner.internScratch(scratch, len);
+	}
+
 	private static ByteString utf8EncodeRangeSlow(String s, int start, int end) {
 		int byteLen = utf8LengthRaw(s, start, end);
 		byte[] out = new byte[byteLen];
@@ -372,12 +459,28 @@ public class UnicodeEscape {
 		return new CompactString(out);
 	}
 
+	private static ByteString utf8EncodeRangeSlow(String s, int start, int end, ByteStringInterner interner) {
+		int byteLen = utf8LengthRaw(s, start, end);
+		byte[] scratch = interner.ensureScratchCapacity(byteLen);
+		int written = writeUtf8Raw(s, start, end, scratch, 0);
+		assert written == byteLen;
+		return interner.internScratch(scratch, written);
+	}
+
 	private static ByteString utf8EncodeRangeSlow(char[] buffer, int start, int end) {
 		int byteLen = utf8LengthRaw(buffer, start, end);
 		byte[] out = new byte[byteLen];
 		int written = writeUtf8Raw(buffer, start, end, out, 0);
 		assert written == byteLen;
 		return new CompactString(out);
+	}
+
+	private static ByteString utf8EncodeRangeSlow(char[] buffer, int start, int end, ByteStringInterner interner) {
+		int byteLen = utf8LengthRaw(buffer, start, end);
+		byte[] scratch = interner.ensureScratchCapacity(byteLen);
+		int written = writeUtf8Raw(buffer, start, end, scratch, 0);
+		assert written == byteLen;
+		return interner.internScratch(scratch, written);
 	}
 
 	private static int utf8LengthRaw(String s, int start, int end) {
