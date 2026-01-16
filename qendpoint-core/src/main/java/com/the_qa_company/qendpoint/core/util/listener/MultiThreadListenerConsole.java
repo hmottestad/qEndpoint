@@ -9,7 +9,7 @@ import com.the_qa_company.qendpoint.core.listener.ProgressMessage;
 public class MultiThreadListenerConsole implements MultiThreadListener {
 	private static final int BAR_SIZE = 10;
 	private static final String ERASE_LINE = "\r\033[K";
-	private static final long REFRESH_MILLIS = 50;
+	private static final long REFRESH_MILLIS = 300;
 
 	private static String goBackNLine(int line) {
 		return "\033[" + line + "A";
@@ -157,22 +157,24 @@ public class MultiThreadListenerConsole implements MultiThreadListener {
 	}
 
 	@Override
-	public synchronized void notifyProgress(String thread, float level, String message) {
+	public void notifyProgress(String thread, float level, String message) {
 		notifyProgress(thread, level, ProgressMessage.literal(message));
 	}
 
-	public synchronized void notifyProgress(String thread, float level, ProgressMessage message) {
-		if (threadMessages != null) {
-			ThreadState state = threadMessages.get(thread);
-			if (state == null) {
-				state = new ThreadState();
-				threadMessages.put(thread, state);
+	public void notifyProgress(String thread, float level, ProgressMessage message) {
+		synchronized (this) {
+			if (threadMessages != null) {
+				ThreadState state = threadMessages.get(thread);
+				if (state == null) {
+					state = new ThreadState();
+					threadMessages.put(thread, state);
+				}
+				state.level = level;
+				state.message = message;
+			} else {
+				String msg = colorReset() + progressBar(level) + colorReset() + " " + message.render();
+				System.out.println(colorReset() + "[" + colorThread() + thread + colorReset() + "]" + msg);
 			}
-			state.level = level;
-			state.message = message;
-		} else {
-			String msg = colorReset() + progressBar(level) + colorReset() + " " + message.render();
-			System.out.println(colorReset() + "[" + colorThread() + thread + colorReset() + "]" + msg);
 		}
 	}
 

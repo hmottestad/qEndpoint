@@ -22,6 +22,6 @@ public class MultiThreadListenerConsoleCompatibilityTest {
 
 		Field refreshField = MultiThreadListenerConsole.class.getDeclaredField("REFRESH_MILLIS");
 		refreshField.setAccessible(true);
-		assertEquals(500L, refreshField.getLong(null));
+		assertEquals(300L, refreshField.getLong(null));
 	}
 }
