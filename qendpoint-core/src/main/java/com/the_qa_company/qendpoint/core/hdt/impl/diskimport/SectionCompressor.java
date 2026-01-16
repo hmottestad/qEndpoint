@@ -13,7 +13,6 @@ import com.the_qa_company.qendpoint.core.iterator.utils.SizeFetcher;
 import com.the_qa_company.qendpoint.core.iterator.utils.SizedSupplier;
 import com.the_qa_company.qendpoint.core.util.concurrent.ExceptionFunction;
 import com.the_qa_company.qendpoint.core.util.concurrent.ExceptionSupplier;
-import com.the_qa_company.qendpoint.core.util.concurrent.ExceptionThread;
 import com.the_qa_company.qendpoint.core.util.concurrent.KWayMerger;
 import com.the_qa_company.qendpoint.core.util.concurrent.KWayMergerChunked;
 import com.the_qa_company.qendpoint.core.util.io.CloseSuppressPath;
@@ -32,9 +31,12 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -48,6 +50,14 @@ import java.util.function.Supplier;
 public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString, SizedSupplier<TripleString>>,
 		KWayMergerChunked.KWayMergerChunkedImpl<TripleString, SizedSupplier<TripleString>> {
 	private static final Logger log = LoggerFactory.getLogger(SectionCompressor.class);
+	private static final int MERGE_THREADS = Math.max(1, Runtime.getRuntime().availableProcessors());
+	private static final ThreadPoolExecutor MERGE_EXECUTOR = (ThreadPoolExecutor) Executors
+			.newFixedThreadPool(MERGE_THREADS, new MergeThreadFactory());
+
+	static {
+		Runtime.getRuntime().addShutdownHook(
+				new Thread(SectionCompressor::shutdownMergeExecutor, "SectionCompressor-merge-shutdown"));
+	}
 
 	private final CloseSuppressPath baseFileName;
 	private final AsyncIteratorFetcher<TripleString> source; // may be null in
@@ -613,63 +623,42 @@ public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString
 		 *                              thread
 		 */
 		public void compute(List<TripleFile> triples, boolean async) throws IOException, InterruptedException {
-			if (!async) {
-				int taskCount = supportsGraph() ? 4 : 3;
-				ExecutorService executorService = Executors.newFixedThreadPool(taskCount);
+			List<Future<?>> futures = new ArrayList<>(supportsGraph() ? 4 : 3);
+			futures.add(MERGE_EXECUTOR.submit(() -> {
 				try {
-					Future<?> subjectFuture = executorService.submit(() -> {
-						computeSubject(triples, false);
-						return null;
-					});
-					Future<?> predicateFuture = executorService.submit(() -> {
-						computePredicate(triples, false);
-						return null;
-					});
-					Future<?> objectFuture = executorService.submit(() -> {
-						computeObject(triples, false);
-						return null;
-					});
-					Future<?> graphFuture = null;
-					if (supportsGraph()) {
-						graphFuture = executorService.submit(() -> {
-							computeGraph(triples, false);
-							return null;
-						});
-					}
-
-					subjectFuture.get();
-					predicateFuture.get();
-					objectFuture.get();
-					if (graphFuture != null) {
-						graphFuture.get();
-					}
-				} catch (InterruptedException e) {
-					executorService.shutdownNow();
-					Thread.currentThread().interrupt();
-					throw e;
-				} catch (ExecutionException e) {
-					executorService.shutdownNow();
-					Throwable cause = e.getCause();
-					if (cause instanceof IOException ioException) {
-						throw ioException;
-					}
-					if (cause instanceof RuntimeException runtimeException
-							&& runtimeException.getCause() instanceof IOException ioException) {
-						throw ioException;
-					}
-					throw new IOException(cause);
-				} finally {
-					executorService.shutdown();
+					computeSubject(triples, async);
+				} catch (IOException e) {
+					throw new RuntimeException(e);
 				}
-			} else {
-
-				ExceptionThread.async("SectionMerger" + root.getFileName(), () -> computeSubject(triples, true),
-						() -> computePredicate(triples, true), () -> computeObject(triples, true), () -> {
-							if (supportsGraph()) {
-								computeGraph(triples, true);
-							}
-						}).joinAndCrashIfRequired();
+				return null;
+			}));
+			futures.add(MERGE_EXECUTOR.submit(() -> {
+				try {
+					computePredicate(triples, async);
+				} catch (IOException e) {
+					throw new RuntimeException(e);
+				}
+				return null;
+			}));
+			futures.add(MERGE_EXECUTOR.submit(() -> {
+				try {
+					computeObject(triples, async);
+				} catch (IOException e) {
+					throw new RuntimeException(e);
+				}
+				return null;
+			}));
+			if (supportsGraph()) {
+				futures.add(MERGE_EXECUTOR.submit(() -> {
+					try {
+						computeGraph(triples, async);
+					} catch (IOException e) {
+						throw new RuntimeException(e);
+					}
+					return null;
+				}));
 			}
+			awaitMergeTasks(futures);
 		}
 
 		private void computeSubject(List<TripleFile> triples, boolean async) throws IOException {
@@ -732,6 +721,60 @@ public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString
 					IOUtil.closeAll(fileDeletes);
 				}
 			}
+		}
+	}
+
+	private static void awaitMergeTasks(List<Future<?>> futures) throws IOException, InterruptedException {
+		try {
+			for (Future<?> future : futures) {
+				future.get();
+			}
+		} catch (InterruptedException e) {
+			cancelMergeTasks(futures);
+			Thread.currentThread().interrupt();
+			throw e;
+		} catch (ExecutionException e) {
+			cancelMergeTasks(futures);
+			Throwable cause = e.getCause();
+			if (cause instanceof IOException ioException) {
+				throw ioException;
+			}
+			if (cause instanceof RuntimeException runtimeException
+					&& runtimeException.getCause() instanceof IOException ioException) {
+				throw ioException;
+			}
+			throw new IOException(cause);
+		}
+	}
+
+	private static void cancelMergeTasks(List<Future<?>> futures) {
+		for (Future<?> future : futures) {
+			future.cancel(true);
+		}
+	}
+
+	private static void shutdownMergeExecutor() {
+		MERGE_EXECUTOR.shutdown();
+		try {
+			if (!MERGE_EXECUTOR.awaitTermination(30, TimeUnit.SECONDS)) {
+				MERGE_EXECUTOR.shutdownNow();
+			}
+		} catch (InterruptedException e) {
+			MERGE_EXECUTOR.shutdownNow();
+			Thread.currentThread().interrupt();
+		}
+	}
+
+	private static final class MergeThreadFactory implements ThreadFactory {
+		private final ThreadFactory delegate = Executors.defaultThreadFactory();
+		private final AtomicInteger threadId = new AtomicInteger(1);
+
+		@Override
+		public Thread newThread(Runnable runnable) {
+			Thread thread = delegate.newThread(runnable);
+			thread.setName("section-compressor-merge-" + threadId.getAndIncrement());
+			thread.setDaemon(true);
+			return thread;
 		}
 	}
 
