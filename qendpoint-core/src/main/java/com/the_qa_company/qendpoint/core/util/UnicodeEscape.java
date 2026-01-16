@@ -283,6 +283,29 @@ public class UnicodeEscape {
 	}
 
 	/**
+	 * Unescapes an escaped Unicode string stored in a character buffer into a
+	 * {@link ByteString} without allocating an intermediate {@link String}.
+	 *
+	 * @param buffer escaped input buffer
+	 * @param start  start index (inclusive)
+	 * @param end    end index (exclusive)
+	 * @return unescaped UTF-8 {@link ByteString}
+	 */
+	public static ByteString unescapeByteString(char[] buffer, int start, int end) {
+		int backSlashIdx = indexOf(buffer, start, end, '\\');
+
+		if (backSlashIdx == -1) {
+			return utf8EncodeRange(buffer, start, end);
+		}
+
+		int byteLen = utf8LengthAfterUnescape(buffer, start, end);
+		byte[] out = new byte[byteLen];
+		int written = writeUtf8AfterUnescape(buffer, start, end, out, 0);
+		assert written == byteLen;
+		return new CompactString(out);
+	}
+
+	/**
 	 * Unescapes an escaped UTF-8 sequence from a {@link BigMappedByteBuffer},
 	 * producing a {@link ByteString} without allocating an intermediate
 	 * {@link String}.
@@ -328,10 +351,31 @@ public class UnicodeEscape {
 		return new CompactString(out);
 	}
 
+	private static ByteString utf8EncodeRange(char[] buffer, int start, int end) {
+		int len = end - start;
+		byte[] out = new byte[len];
+		for (int i = 0; i < len; i++) {
+			char c = buffer[start + i];
+			if (c >= 0x80) {
+				return utf8EncodeRangeSlow(buffer, start, end);
+			}
+			out[i] = (byte) c;
+		}
+		return new CompactString(out);
+	}
+
 	private static ByteString utf8EncodeRangeSlow(String s, int start, int end) {
 		int byteLen = utf8LengthRaw(s, start, end);
 		byte[] out = new byte[byteLen];
 		int written = writeUtf8Raw(s, start, end, out, 0);
+		assert written == byteLen;
+		return new CompactString(out);
+	}
+
+	private static ByteString utf8EncodeRangeSlow(char[] buffer, int start, int end) {
+		int byteLen = utf8LengthRaw(buffer, start, end);
+		byte[] out = new byte[byteLen];
+		int written = writeUtf8Raw(buffer, start, end, out, 0);
 		assert written == byteLen;
 		return new CompactString(out);
 	}
@@ -370,11 +414,78 @@ public class UnicodeEscape {
 		return len;
 	}
 
+	private static int utf8LengthRaw(char[] buffer, int start, int end) {
+		int len = 0;
+		int pendingHigh = -1;
+
+		for (int i = start; i < end; i++) {
+			char c = buffer[i];
+
+			if (pendingHigh != -1) {
+				if (Character.isLowSurrogate(c)) {
+					int cp = Character.toCodePoint((char) pendingHigh, c);
+					len += utf8LengthCodePoint(cp);
+					pendingHigh = -1;
+					continue;
+				}
+				len += utf8LengthCodePoint('?');
+				pendingHigh = -1;
+			}
+
+			if (Character.isHighSurrogate(c)) {
+				pendingHigh = c;
+			} else if (Character.isLowSurrogate(c)) {
+				len += utf8LengthCodePoint('?');
+			} else {
+				len += utf8LengthCodePoint(c);
+			}
+		}
+
+		if (pendingHigh != -1) {
+			len += utf8LengthCodePoint('?');
+		}
+
+		return len;
+	}
+
 	private static int writeUtf8Raw(String s, int start, int end, byte[] out, int off) {
 		int pendingHigh = -1;
 
 		for (int i = start; i < end; i++) {
 			char c = s.charAt(i);
+
+			if (pendingHigh != -1) {
+				if (Character.isLowSurrogate(c)) {
+					int cp = Character.toCodePoint((char) pendingHigh, c);
+					off = writeUtf8CodePoint(cp, out, off);
+					pendingHigh = -1;
+					continue;
+				}
+				off = writeUtf8CodePoint('?', out, off);
+				pendingHigh = -1;
+			}
+
+			if (Character.isHighSurrogate(c)) {
+				pendingHigh = c;
+			} else if (Character.isLowSurrogate(c)) {
+				off = writeUtf8CodePoint('?', out, off);
+			} else {
+				off = writeUtf8CodePoint(c, out, off);
+			}
+		}
+
+		if (pendingHigh != -1) {
+			off = writeUtf8CodePoint('?', out, off);
+		}
+
+		return off;
+	}
+
+	private static int writeUtf8Raw(char[] buffer, int start, int end, byte[] out, int off) {
+		int pendingHigh = -1;
+
+		for (int i = start; i < end; i++) {
+			char c = buffer[i];
 
 			if (pendingHigh != -1) {
 				if (Character.isLowSurrogate(c)) {
@@ -502,6 +613,121 @@ public class UnicodeEscape {
 				continue;
 			}
 			default -> throw new IllegalArgumentException("Unescaped backslash in: " + s);
+			}
+
+			if (esc == 't' || esc == 'r' || esc == 'n' || esc == '"' || esc == '\\') {
+				i += 2;
+				pendingHigh = -1;
+				continue;
+			}
+		}
+
+		if (pendingHigh != -1) {
+			len += utf8LengthCodePoint('?');
+		}
+
+		return len;
+	}
+
+	private static int utf8LengthAfterUnescape(char[] buffer, int start, int end) {
+		int len = 0;
+		int pendingHigh = -1;
+		int i = start;
+
+		while (i < end) {
+			char c = buffer[i];
+
+			if (c != '\\') {
+				if (pendingHigh != -1) {
+					if (Character.isLowSurrogate(c)) {
+						int cp = Character.toCodePoint((char) pendingHigh, c);
+						len += utf8LengthCodePoint(cp);
+						pendingHigh = -1;
+						i++;
+						continue;
+					}
+					len += utf8LengthCodePoint('?');
+					pendingHigh = -1;
+				}
+
+				if (Character.isHighSurrogate(c)) {
+					pendingHigh = c;
+				} else if (Character.isLowSurrogate(c)) {
+					len += utf8LengthCodePoint('?');
+				} else {
+					len += utf8LengthCodePoint(c);
+				}
+				i++;
+				continue;
+			}
+
+			if (i + 1 >= end) {
+				throw new IllegalArgumentException("Unescaped backslash in input buffer");
+			}
+
+			char esc = buffer[i + 1];
+			switch (esc) {
+			case 't' -> len = utf8LengthEmitChar('\t', pendingHigh, len);
+			case 'r' -> len = utf8LengthEmitChar('\r', pendingHigh, len);
+			case 'n' -> len = utf8LengthEmitChar('\n', pendingHigh, len);
+			case '"' -> len = utf8LengthEmitChar('"', pendingHigh, len);
+			case '\\' -> len = utf8LengthEmitChar('\\', pendingHigh, len);
+			case 'u' -> {
+				if (i + 5 >= end) {
+					throw new IllegalArgumentException("Incomplete Unicode escape sequence in input buffer");
+				}
+				int cp = parseHex4(buffer, i + 2, end, 'u');
+				char decoded = (char) cp;
+
+				if (pendingHigh != -1) {
+					if (Character.isLowSurrogate(decoded)) {
+						len += utf8LengthCodePoint(Character.toCodePoint((char) pendingHigh, decoded));
+						pendingHigh = -1;
+					} else {
+						len += utf8LengthCodePoint('?');
+						pendingHigh = Character.isHighSurrogate(decoded) ? decoded : -1;
+						if (pendingHigh == -1) {
+							len += utf8LengthEmitNonSurrogateChar(decoded);
+						}
+					}
+				} else if (Character.isHighSurrogate(decoded)) {
+					pendingHigh = decoded;
+				} else if (Character.isLowSurrogate(decoded)) {
+					len += utf8LengthCodePoint('?');
+				} else {
+					len += utf8LengthCodePoint(decoded);
+				}
+				i += 6;
+				continue;
+			}
+			case 'U' -> {
+				if (i + 9 >= end) {
+					throw new IllegalArgumentException("Incomplete Unicode escape sequence in input buffer");
+				}
+				int cp = parseHex8ToInt(buffer, i + 2, end, 'U');
+				char[] chars = Character.toChars(cp);
+				for (char decoded : chars) {
+					if (pendingHigh != -1) {
+						if (Character.isLowSurrogate(decoded)) {
+							len += utf8LengthCodePoint(Character.toCodePoint((char) pendingHigh, decoded));
+							pendingHigh = -1;
+							continue;
+						}
+						len += utf8LengthCodePoint('?');
+						pendingHigh = -1;
+					}
+					if (Character.isHighSurrogate(decoded)) {
+						pendingHigh = decoded;
+					} else if (Character.isLowSurrogate(decoded)) {
+						len += utf8LengthCodePoint('?');
+					} else {
+						len += utf8LengthCodePoint(decoded);
+					}
+				}
+				i += 10;
+				continue;
+			}
+			default -> throw new IllegalArgumentException("Unescaped backslash in input buffer");
 			}
 
 			if (esc == 't' || esc == 'r' || esc == 'n' || esc == '"' || esc == '\\') {
@@ -786,6 +1012,157 @@ public class UnicodeEscape {
 		return off;
 	}
 
+	private static int writeUtf8AfterUnescape(char[] buffer, int start, int end, byte[] out, int off) {
+		int pendingHigh = -1;
+		int i = start;
+
+		while (i < end) {
+			char c = buffer[i];
+
+			if (c != '\\') {
+				if (pendingHigh != -1) {
+					if (Character.isLowSurrogate(c)) {
+						int cp = Character.toCodePoint((char) pendingHigh, c);
+						off = writeUtf8CodePoint(cp, out, off);
+						pendingHigh = -1;
+						i++;
+						continue;
+					}
+					off = writeUtf8CodePoint('?', out, off);
+					pendingHigh = -1;
+				}
+
+				if (Character.isHighSurrogate(c)) {
+					pendingHigh = c;
+				} else if (Character.isLowSurrogate(c)) {
+					off = writeUtf8CodePoint('?', out, off);
+				} else {
+					off = writeUtf8CodePoint(c, out, off);
+				}
+				i++;
+				continue;
+			}
+
+			if (i + 1 >= end) {
+				throw new IllegalArgumentException("Unescaped backslash in input buffer");
+			}
+
+			char esc = buffer[i + 1];
+			switch (esc) {
+			case 't' -> {
+				if (pendingHigh != -1) {
+					off = writeUtf8CodePoint('?', out, off);
+					pendingHigh = -1;
+				}
+				off = writeUtf8CodePoint('\t', out, off);
+				i += 2;
+				continue;
+			}
+			case 'r' -> {
+				if (pendingHigh != -1) {
+					off = writeUtf8CodePoint('?', out, off);
+					pendingHigh = -1;
+				}
+				off = writeUtf8CodePoint('\r', out, off);
+				i += 2;
+				continue;
+			}
+			case 'n' -> {
+				if (pendingHigh != -1) {
+					off = writeUtf8CodePoint('?', out, off);
+					pendingHigh = -1;
+				}
+				off = writeUtf8CodePoint('\n', out, off);
+				i += 2;
+				continue;
+			}
+			case '"' -> {
+				if (pendingHigh != -1) {
+					off = writeUtf8CodePoint('?', out, off);
+					pendingHigh = -1;
+				}
+				off = writeUtf8CodePoint('\"', out, off);
+				i += 2;
+				continue;
+			}
+			case '\\' -> {
+				if (pendingHigh != -1) {
+					off = writeUtf8CodePoint('?', out, off);
+					pendingHigh = -1;
+				}
+				off = writeUtf8CodePoint('\\', out, off);
+				i += 2;
+				continue;
+			}
+			case 'u' -> {
+				if (i + 5 >= end) {
+					throw new IllegalArgumentException("Incomplete Unicode escape sequence in input buffer");
+				}
+				int cp = parseHex4(buffer, i + 2, end, 'u');
+				char decoded = (char) cp;
+
+				if (pendingHigh != -1) {
+					if (Character.isLowSurrogate(decoded)) {
+						off = writeUtf8CodePoint(Character.toCodePoint((char) pendingHigh, decoded), out, off);
+						pendingHigh = -1;
+						i += 6;
+						continue;
+					} else {
+						off = writeUtf8CodePoint('?', out, off);
+						pendingHigh = -1;
+					}
+				}
+
+				if (Character.isHighSurrogate(decoded)) {
+					pendingHigh = decoded;
+				} else if (Character.isLowSurrogate(decoded)) {
+					off = writeUtf8CodePoint('?', out, off);
+				} else {
+					off = writeUtf8CodePoint(decoded, out, off);
+				}
+
+				i += 6;
+				continue;
+			}
+			case 'U' -> {
+				if (i + 9 >= end) {
+					throw new IllegalArgumentException("Incomplete Unicode escape sequence in input buffer");
+				}
+				int cp = parseHex8ToInt(buffer, i + 2, end, 'U');
+				char[] chars = Character.toChars(cp);
+				for (char decoded : chars) {
+					if (pendingHigh != -1) {
+						if (Character.isLowSurrogate(decoded)) {
+							off = writeUtf8CodePoint(Character.toCodePoint((char) pendingHigh, decoded), out, off);
+							pendingHigh = -1;
+							continue;
+						}
+						off = writeUtf8CodePoint('?', out, off);
+						pendingHigh = -1;
+					}
+
+					if (Character.isHighSurrogate(decoded)) {
+						pendingHigh = decoded;
+					} else if (Character.isLowSurrogate(decoded)) {
+						off = writeUtf8CodePoint('?', out, off);
+					} else {
+						off = writeUtf8CodePoint(decoded, out, off);
+					}
+				}
+				i += 10;
+				continue;
+			}
+			default -> throw new IllegalArgumentException("Unescaped backslash in input buffer");
+			}
+		}
+
+		if (pendingHigh != -1) {
+			off = writeUtf8CodePoint('?', out, off);
+		}
+
+		return off;
+	}
+
 	private static int utf8LengthCodePoint(int cp) {
 		if (cp < 0x80) {
 			return 1;
@@ -831,6 +1208,15 @@ public class UnicodeEscape {
 		return -1L;
 	}
 
+	private static int indexOf(char[] buffer, int start, int end, char value) {
+		for (int i = start; i < end; i++) {
+			if (buffer[i] == value) {
+				return i;
+			}
+		}
+		return -1;
+	}
+
 	private static int hexValue(byte b) {
 		if (b >= '0' && b <= '9') {
 			return b - '0';
@@ -871,6 +1257,19 @@ public class UnicodeEscape {
 		return (h0 << 12) | (h1 << 8) | (h2 << 4) | h3;
 	}
 
+	private static int parseHex4(char[] buffer, int pos, int end, char escapeType) {
+		int h0 = hexValue(buffer[pos]);
+		int h1 = hexValue(buffer[pos + 1]);
+		int h2 = hexValue(buffer[pos + 2]);
+		int h3 = hexValue(buffer[pos + 3]);
+		if ((h0 | h1 | h2 | h3) < 0) {
+			String xx = new String(buffer, pos, 4);
+			throw new IllegalArgumentException(
+					"Illegal Unicode escape sequence '\\" + escapeType + xx + "' in input buffer");
+		}
+		return (h0 << 12) | (h1 << 8) | (h2 << 4) | h3;
+	}
+
 	private static int parseHex4(String s, int pos, int end, char escapeType) {
 		int h0 = hexValue(s.charAt(pos));
 		int h1 = hexValue(s.charAt(pos + 1));
@@ -904,6 +1303,25 @@ public class UnicodeEscape {
 			}
 			throw new IllegalArgumentException(
 					"Illegal Unicode escape sequence '\\" + escapeType + sb + "' in input buffer");
+		}
+		return (int) value;
+	}
+
+	private static int parseHex8ToInt(char[] buffer, int pos, int end, char escapeType) {
+		long value = 0;
+		for (int i = 0; i < 8; i++) {
+			int hv = hexValue(buffer[pos + i]);
+			if (hv < 0) {
+				String xx = new String(buffer, pos, 8);
+				throw new IllegalArgumentException(
+						"Illegal Unicode escape sequence '\\" + escapeType + xx + "' in input buffer");
+			}
+			value = (value << 4) | hv;
+		}
+		if (value > Integer.MAX_VALUE) {
+			String xx = new String(buffer, pos, 8);
+			throw new IllegalArgumentException(
+					"Illegal Unicode escape sequence '\\" + escapeType + xx + "' in input buffer");
 		}
 		return (int) value;
 	}

@@ -227,6 +227,16 @@ public class TripleString {
 		return -1;
 	}
 
+	private int searchNextTabOrSpace(char[] line, int start, int end) {
+		for (int i = start; i < end; i++) {
+			char c = line[i];
+			if (c == ' ' || c == '\t') {
+				return i;
+			}
+		}
+		return -1;
+	}
+
 	private int searchBNodeBackward(String line, int start, int end) {
 		// bn grammar
 		// BLANK_NODE_LABEL ::= '_:' (PN_CHARS_U | [0-9]) ((PN_CHARS | '.')*
@@ -264,6 +274,42 @@ public class TripleString {
 			}
 			}
 			loc--;
+		}
+		return -1;
+	}
+
+	private int searchBNodeBackward(char[] line, int start, int end) {
+		int loc = end - 1;
+
+		while (loc >= start) {
+			char c = line[loc];
+			switch (c) {
+			case ' ', '\t' -> {
+				if (loc + 2 >= end) {
+					return -1;
+				}
+				if (line[loc + 1] == '_' && line[loc + 2] == ':') {
+					return loc;
+				}
+			}
+			case '^', '@', '>', '<', '"' -> {
+				return -1;
+			}
+			default -> {
+			}
+			}
+			loc--;
+		}
+		return -1;
+	}
+
+	private int lastIndexOf(char[] line, char value, int from, int min) {
+		int i = Math.min(from, line.length - 1);
+		while (i >= min) {
+			if (line[i] == value) {
+				return i;
+			}
+			i--;
 		}
 		return -1;
 	}
@@ -307,9 +353,29 @@ public class TripleString {
 		readImpl(line, start, end, processQuad, UnicodeEscape::unescapeByteString);
 	}
 
+	/**
+	 * Read from a line stored in a character buffer, producing
+	 * {@link ByteString} values directly without allocating intermediate
+	 * {@link String} objects.
+	 *
+	 * @param buffer      line buffer
+	 * @param start       start in the buffer
+	 * @param end         end in the buffer
+	 * @param processQuad process quad
+	 * @throws ParserException if the line is not RDF compliant
+	 */
+	public void readByteString(char[] buffer, int start, int end, boolean processQuad) throws ParserException {
+		readImpl(buffer, start, end, processQuad, UnicodeEscape::unescapeByteString);
+	}
+
 	@FunctionalInterface
 	private interface ComponentDecoder {
 		CharSequence decode(String line, int start, int end);
+	}
+
+	@FunctionalInterface
+	private interface ComponentDecoderChars {
+		CharSequence decode(char[] buffer, int start, int end);
 	}
 
 	private void readImpl(String line, int start, int end, boolean processQuad, ComponentDecoder decoder)
@@ -423,6 +489,110 @@ public class TripleString {
 			// Remove trailing > only if < appears, so "some"^^<http://datatype>
 			// is kept as-is.
 			if (posb > posa && line.charAt(posb - 1) == '>') {
+				posb--;
+			}
+		}
+
+		this.setObject(decoder.decode(line, posa, posb));
+	}
+
+	private void readImpl(char[] line, int start, int end, boolean processQuad, ComponentDecoderChars decoder)
+			throws ParserException {
+		int split, posa, posb;
+		// for quad implementation, don't forget to clear the graph
+		this.clear();
+
+		// SET SUBJECT
+		posa = start;
+		posb = split = searchNextTabOrSpace(line, posa, end);
+
+		if (posb == -1) {
+			// Not found, error.
+			return;
+		}
+		if (line[posa] == '<') {
+			posa++; // Remove <
+			if (line[posb - 1] == '>') {
+				posb--; // Remove >
+			}
+		}
+
+		this.setSubject(decoder.decode(line, posa, posb));
+
+		// SET PREDICATE
+		posa = split + 1;
+		posb = split = searchNextTabOrSpace(line, posa, end);
+
+		if (posb == -1) {
+			return;
+		}
+		if (line[posa] == '<') {
+			posa++;
+			if (posb > posa && line[posb - 1] == '>') {
+				posb--;
+			}
+		}
+
+		this.setPredicate(decoder.decode(line, posa, posb));
+
+		if (processQuad) {
+			// SET OBJECT
+			posa = split + 1;
+			posb = end;
+
+			// Remove trailing <space> <dot> from NTRIPLES.
+			if (line[posb - 1] == '.') {
+				posb--;
+			}
+			char prev = line[posb - 1];
+			if (prev == ' ' || prev == '\t') {
+				posb--;
+			}
+
+			char lastElem = line[posb - 1];
+			if (lastElem != '"') {
+				if (lastElem == '>') {
+					int iriStart = lastIndexOf(line, '<', posb, posa);
+
+					if (iriStart < posa) {
+						throw new ParserException("end of a '>' without a start '<'");
+					}
+					if (posa != iriStart && line[iriStart - 1] != '^') {
+						this.setGraph(decoder.decode(line, iriStart + 1, posb - 1));
+						posb = iriStart - 1;
+					}
+					// not the current element, literal or object iri
+				} else {
+					int bnodeStart = searchBNodeBackward(line, posa, posb);
+					if (bnodeStart > posa) {
+						this.setGraph(decoder.decode(line, bnodeStart + 1, posb));
+						posb = bnodeStart;
+					}
+					// not the current element, literal language or object bnode
+				}
+			}
+			// a literal can't describe a graph
+		} else {
+			// SET OBJECT
+			posa = split + 1;
+			posb = end;
+
+			// Remove trailing <space> <dot> from NTRIPLES.
+			if (line[posb - 1] == '.') {
+				posb--;
+			}
+			char prev = line[posb - 1];
+			if (prev == ' ' || prev == '\t') {
+				posb--;
+			}
+		}
+
+		if (line[posa] == '<') {
+			posa++;
+
+			// Remove trailing > only if < appears, so "some"^^<http://datatype>
+			// is kept as-is.
+			if (posb > posa && line[posb - 1] == '>') {
 				posb--;
 			}
 		}

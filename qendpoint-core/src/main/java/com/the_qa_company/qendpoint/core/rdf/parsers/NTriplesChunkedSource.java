@@ -20,7 +20,6 @@ import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.util.ArrayList;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -42,6 +41,7 @@ public final class NTriplesChunkedSource
 	private final boolean mmapMode;
 
 	private final BufferedReader reader;
+	private final LineReader lineReader;
 	private final Object lock = new Object();
 
 	private final BigMappedByteBuffer mapped;
@@ -83,6 +83,7 @@ public final class NTriplesChunkedSource
 		}
 
 		this.reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8));
+		this.lineReader = new LineReader();
 		this.readQuad = notation == RDFNotation.NQUAD;
 		this.chunkBudgetBytes = chunkBudgetBytes;
 		this.maxBatchBytes = maxBatchBytes;
@@ -107,6 +108,7 @@ public final class NTriplesChunkedSource
 		}
 
 		this.reader = null;
+		this.lineReader = null;
 		this.mmapMode = true;
 		this.readQuad = notation == RDFNotation.NQUAD;
 		this.chunkBudgetBytes = chunkBudgetBytes;
@@ -143,27 +145,11 @@ public final class NTriplesChunkedSource
 		if (mmapMode) {
 			return nextMappedChunk();
 		}
-		// Prefetch a first non-null line so we don't create empty chunks at
-		// EOF.
-		final String firstLine;
-		synchronized (lock) {
-			if (eof) {
-				return null;
-			}
-
-			String line;
-			do {
-				line = reader.readLine();
-				if (line == null) {
-					eof = true;
-					return null;
-				}
-			} while (line.isEmpty());
-
-			firstLine = line;
+		Chunk chunk = new Chunk();
+		if (!chunk.prime()) {
+			return null;
 		}
-
-		return new Chunk(firstLine);
+		return chunk;
 	}
 
 	private SizedSupplier<TripleString> nextMappedChunk() {
@@ -200,7 +186,7 @@ public final class NTriplesChunkedSource
 	}
 
 	private final class Chunk implements SizedSupplier<TripleString> {
-		private final ArrayList<String> lineBuffer = new ArrayList<>(1024);
+		private final LineSliceBuffer lineBuffer;
 		private int idx;
 
 		private long remaining = chunkBudgetBytes;
@@ -209,11 +195,14 @@ public final class NTriplesChunkedSource
 
 		private final TripleString reusable = readQuad ? new QuadString() : new TripleString();
 
-		private Chunk(String firstLine) {
-			lineBuffer.add(firstLine);
-			long est = estimateLineSize(firstLine);
-			size += est;
-			remaining -= est;
+		private Chunk() {
+			int initialCapacity = (int) Math.min(Integer.MAX_VALUE - 8L, Math.max(64L, maxBatchBytes));
+			this.lineBuffer = new LineSliceBuffer(maxBatchLines, initialCapacity);
+		}
+
+		private boolean prime() throws IOException {
+			fillBuffer();
+			return !lineBuffer.isEmpty();
 		}
 
 		@Override
@@ -225,8 +214,7 @@ public final class NTriplesChunkedSource
 			try {
 				while (true) {
 					// Need more lines?
-					if (idx >= lineBuffer.size()) {
-						lineBuffer.clear();
+					if (idx >= lineBuffer.count()) {
 						idx = 0;
 
 						// stop condition for this chunk
@@ -242,8 +230,11 @@ public final class NTriplesChunkedSource
 						}
 					}
 
-					String line = lineBuffer.get(idx++);
-					if (parseLine(line, reusable, readQuad)) {
+					char[] slab = lineBuffer.slab();
+					int start = lineBuffer.startAt(idx);
+					int endExclusive = lineBuffer.endAt(idx);
+					idx++;
+					if (parseLine(slab, start, endExclusive - 1, reusable, readQuad)) {
 						return reusable;
 					}
 					// skip comments/blank/invalid lines, keep scanning
@@ -262,26 +253,22 @@ public final class NTriplesChunkedSource
 			// cap in-memory buffering
 			long batchBudget = Math.min(remaining, maxBatchBytes);
 
-			int count = 0;
+			lineBuffer.reset();
 			synchronized (lock) {
-				while (!eof && count < maxBatchLines && batchBudget > 0) {
-					String line = reader.readLine();
-					if (line == null) {
+				while (!eof && lineBuffer.count() < maxBatchLines && batchBudget > 0) {
+					int lineLen = lineReader.readLine(reader, lineBuffer);
+					if (lineLen < 0) {
 						eof = true;
 						break;
 					}
-					if (line.isEmpty()) {
+					if (lineLen == 0) {
 						continue;
 					}
 
-					lineBuffer.add(line);
-
-					long est = estimateLineSize(line);
+					long est = (long) lineLen + 1L;
 					size += est;
 					remaining -= est;
 					batchBudget -= est;
-
-					count++;
 				}
 			}
 		}
@@ -345,53 +332,50 @@ public final class NTriplesChunkedSource
 		}
 	}
 
-	private static long estimateLineSize(String line) {
-		// Simple but stable: approximates bytes consumed in the NT stream.
-		// (N-Triples is overwhelmingly ASCII; for stats/chunking, char-length
-		// is fine.)
-		return (long) line.length() + 1L; // + '\n'
-	}
-
 	/**
 	 * Mirrors {@link RDFParserSimple}'s whitespace trimming and comment
 	 * skipping.
 	 */
-	private static boolean parseLine(String line, TripleString out, boolean readQuad) {
-		int start = 0;
-		while (start < line.length()) {
-			char c = line.charAt(start);
+	private static boolean parseLine(char[] buffer, int start, int endInclusive, TripleString out, boolean readQuad) {
+		int s = start;
+		while (s <= endInclusive) {
+			char c = buffer[s];
 			if (c != ' ' && c != '\t') {
 				break;
 			}
-			start++;
+			s++;
 		}
 
-		int end = line.length() - 1;
-		while (end >= 0) {
-			char c = line.charAt(end);
+		int e = endInclusive;
+		while (e >= s) {
+			char c = buffer[e];
 			if (c != ' ' && c != '\t') {
 				break;
 			}
-			end--;
+			e--;
 		}
 
-		if (start + 1 >= end) {
+		if (s + 1 >= e) {
 			return false;
 		}
-		if (line.charAt(start) == '#') {
+		if (buffer[s] == '#') {
 			return false;
 		}
 
 		try {
-			out.readByteString(line, start, end, readQuad);
+			out.readByteString(buffer, s, e, readQuad);
 			if (!out.hasEmpty()) {
 				return true;
 			}
 
-			log.warn("Could not parse triple, ignored.\n{}", line);
+			if (log.isWarnEnabled()) {
+				log.warn("Could not parse triple, ignored.\n{}", segmentToString(buffer, s, e));
+			}
 			return false;
-		} catch (Exception e) {
-			log.warn("Could not parse triple, ignored.\n{}", line);
+		} catch (Exception e1) {
+			if (log.isWarnEnabled()) {
+				log.warn("Could not parse triple, ignored.\n{}", segmentToString(buffer, s, e));
+			}
 			return false;
 		}
 	}
@@ -628,5 +612,10 @@ public final class NTriplesChunkedSource
 			data[i] = buffer.get(start + i);
 		}
 		return new String(data, StandardCharsets.UTF_8);
+	}
+
+	private static String segmentToString(char[] buffer, int start, int endInclusive) {
+		int len = endInclusive - start + 1;
+		return new String(buffer, start, len);
 	}
 }
