@@ -19,9 +19,11 @@
 package com.the_qa_company.qendpoint.core.rdf.parsers;
 
 import java.io.FileNotFoundException;
+import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 
 import com.the_qa_company.qendpoint.core.quad.QuadString;
 import org.apache.jena.graph.Triple;
@@ -65,33 +67,8 @@ public class RDFParserRIOT implements RDFParserCallback {
 			if (keepBNode) {
 				ChunkedConcurrentInputStream cs = new ChunkedConcurrentInputStream(stream, workerStreams);
 				InputStream bnodes = cs.getBnodeStream();
-
-				List<Thread> threads = new ArrayList<>();
-				Thread e1 = new Thread(() -> RDFParser.source(bnodes).base(baseUri).lang(lang)
-						.labelToNode(LabelToNode.createUseLabelAsGiven()).parse(buffer));
-				e1.setName("BNode parser");
-				threads.add(e1);
-
 				InputStream[] streams = cs.getStreams();
-				for (int i = 0; i < streams.length; i++) {
-					InputStream s = streams[i];
-					Thread e = new Thread(() -> RDFParser.source(s).base(baseUri).lang(lang)
-							.labelToNode(LabelToNode.createUseLabelAsGiven()).parse(buffer));
-					e.setName("Stream parser " + (i + 1));
-					threads.add(e);
-				}
-
-				threads.forEach(Thread::start);
-				for (Thread thread : threads) {
-					try {
-						while (thread.isAlive()) {
-							thread.join(1000);
-						}
-					} catch (InterruptedException e) {
-						Thread.currentThread().interrupt();
-						throw new RuntimeException(e);
-					}
-				}
+				runParallelParsers(bnodes, streams, baseUri, lang, buffer);
 			} else {
 				RDFParser.source(stream).base(baseUri).lang(lang).parse(buffer);
 			}
@@ -102,33 +79,8 @@ public class RDFParserRIOT implements RDFParserCallback {
 			if (keepBNode) {
 				ConcurrentInputStream cs = new ConcurrentInputStream(stream, workerStreams);
 				InputStream bnodes = cs.getBnodeStream();
-
-				List<Thread> threads = new ArrayList<>();
-				Thread e1 = new Thread(() -> RDFParser.source(bnodes).base(baseUri).lang(lang)
-						.labelToNode(LabelToNode.createUseLabelAsGiven()).parse(buffer));
-				e1.setName("BNode parser");
-				threads.add(e1);
-
 				InputStream[] streams = cs.getStreams();
-				for (int i = 0; i < streams.length; i++) {
-					InputStream s = streams[i];
-					Thread e = new Thread(() -> RDFParser.source(s).base(baseUri).lang(lang)
-							.labelToNode(LabelToNode.createUseLabelAsGiven()).parse(buffer));
-					e.setName("Stream parser " + (i + 1));
-					threads.add(e);
-				}
-
-				threads.forEach(Thread::start);
-				for (Thread thread : threads) {
-					try {
-						while (thread.isAlive()) {
-							thread.join(1000);
-						}
-					} catch (InterruptedException e) {
-						Thread.currentThread().interrupt();
-						throw new RuntimeException(e);
-					}
-				}
+				runParallelParsers(bnodes, streams, baseUri, lang, buffer);
 			} else {
 				RDFParser.source(stream).base(baseUri).lang(lang).parse(buffer);
 			}
@@ -140,6 +92,65 @@ public class RDFParserRIOT implements RDFParserCallback {
 					.parse(buffer);
 		} else {
 			RDFParser.source(stream).base(baseUri).lang(lang).parse(buffer);
+		}
+	}
+
+	private void runParallelParsers(InputStream bnodeStream, InputStream[] streams, String baseUri, Lang lang,
+			ElemStringBuffer buffer) {
+		List<InputStream> allStreams = new ArrayList<>();
+		List<Thread> threads = new ArrayList<>();
+		AtomicReference<Throwable> failure = new AtomicReference<>();
+
+		allStreams.add(bnodeStream);
+		threads.add(buildParserThread(bnodeStream, "BNode parser", baseUri, lang, buffer, failure, allStreams));
+
+		for (int i = 0; i < streams.length; i++) {
+			InputStream stream = streams[i];
+			allStreams.add(stream);
+			threads.add(
+					buildParserThread(stream, "Stream parser " + (i + 1), baseUri, lang, buffer, failure, allStreams));
+		}
+
+		threads.forEach(Thread::start);
+		for (Thread thread : threads) {
+			try {
+				while (thread.isAlive()) {
+					thread.join(1000);
+				}
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				throw new RuntimeException(e);
+			}
+		}
+
+		Throwable thrown = failure.get();
+		if (thrown != null) {
+			throw new RuntimeException("Parallel parse failed", thrown);
+		}
+	}
+
+	private Thread buildParserThread(InputStream stream, String name, String baseUri, Lang lang,
+			ElemStringBuffer buffer, AtomicReference<Throwable> failure, List<InputStream> allStreams) {
+		Thread thread = new Thread(() -> {
+			try {
+				RDFParser.source(stream).base(baseUri).lang(lang).labelToNode(LabelToNode.createUseLabelAsGiven())
+						.parse(buffer);
+			} catch (Throwable t) {
+				if (failure.compareAndSet(null, t)) {
+					closeStreams(allStreams);
+				}
+			}
+		});
+		thread.setName(name);
+		return thread;
+	}
+
+	private void closeStreams(List<InputStream> streams) {
+		for (InputStream stream : streams) {
+			try {
+				stream.close();
+			} catch (IOException ignored) {
+			}
 		}
 	}
 

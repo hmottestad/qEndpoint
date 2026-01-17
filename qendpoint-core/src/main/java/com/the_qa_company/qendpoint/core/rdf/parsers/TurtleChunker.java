@@ -119,9 +119,8 @@ public class TurtleChunker {
 			if (bufLen == 0) {
 				// no more data => produce leftover partial if any
 				if (partialBytes.size() > 0) { // CHANGED
-					partialBytes.reset(); // CHANGED
-					// CHANGED
 					String leftoverStr = partialBytes.toString(StandardCharsets.UTF_8);
+					partialBytes.reset(); // CHANGED
 					leftoverStr = leftoverStr.trim();
 					return leftoverStr.isEmpty() ? null : leftoverStr;
 				}
