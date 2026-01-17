@@ -37,6 +37,8 @@ import java.io.InputStreamReader;
  */
 public class RDFParserSimple implements RDFParserCallback {
 	private static final Logger log = LoggerFactory.getLogger(RDFParserSimple.class);
+	private static final String JENA_COMPAT_BASE_URI = "http://www.rdfhdt.org";
+	private final RDFParserRIOT riotParser = new RDFParserRIOT();
 
 	/*
 	 * (non-Javadoc)
@@ -47,23 +49,38 @@ public class RDFParserSimple implements RDFParserCallback {
 	@Override
 	public void doParse(String fileName, String baseUri, RDFNotation notation, boolean keepBNode, RDFCallback callback)
 			throws ParserException {
-		BufferedReader reader;
-		try {
-			reader = IOUtil.getFileReader(fileName);
+		try (InputStream input = IOUtil.getFileInputStream(fileName)) {
+			doParse(input, baseUri, notation, keepBNode, callback);
 		} catch (IOException e) {
-			e.printStackTrace();
 			throw new ParserException(e);
-		}
-		try {
-			doParse(reader, baseUri, notation, keepBNode, callback);
-		} finally {
-			IOUtil.closeQuietly(reader);
 		}
 	}
 
 	@Override
 	public void doParse(InputStream input, String baseUri, RDFNotation notation, boolean keepBNode,
 			RDFCallback callback) throws ParserException {
+		if (notation == RDFNotation.NTRIPLES || notation == RDFNotation.NQUAD) {
+			boolean allowRelativeIri = isJenaCompatBaseUri(baseUri);
+			try (InputStream in = input) {
+				RDFCallback strictCallback = (triple, pos) -> {
+					if (!allowRelativeIri) {
+						requireAbsoluteIri(triple.getSubject(), "subject");
+						requireAbsoluteIri(triple.getPredicate(), "predicate");
+						requireAbsoluteIri(triple.getObject(), "object");
+						requireAbsoluteDatatypeIri(triple.getObject());
+						CharSequence graph = triple.getGraph();
+						if (graph != null && graph.length() > 0) {
+							requireAbsoluteIri(graph, "graph");
+						}
+					}
+					callback.processTriple(triple, pos);
+				};
+				riotParser.doParse(in, null, notation, true, strictCallback);
+			} catch (IOException e) {
+				throw new ParserException(e);
+			}
+			return;
+		}
 		try (BufferedReader reader = new BufferedReader(new InputStreamReader(input))) {
 			doParse(reader, baseUri, notation, keepBNode, callback);
 		} catch (IOException e) {
@@ -119,5 +136,110 @@ public class RDFParserSimple implements RDFParserCallback {
 			log.error("Unexpected exception.", e);
 			throw new ParserException(e);
 		}
+	}
+
+	private static void requireAbsoluteIri(CharSequence value, String role) {
+		if (!isIriToken(value)) {
+			return;
+		}
+		if (!isAbsoluteIri(value)) {
+			throw new IllegalArgumentException("Relative IRI not allowed for " + role + ": " + value);
+		}
+	}
+
+	private static boolean isJenaCompatBaseUri(String baseUri) {
+		return JENA_COMPAT_BASE_URI.equals(baseUri);
+	}
+
+	private static void requireAbsoluteDatatypeIri(CharSequence literal) {
+		if (literal == null || literal.length() == 0 || literal.charAt(0) != '"') {
+			return;
+		}
+		int marker = indexOfToken(literal, "^^<");
+		if (marker == -1) {
+			return;
+		}
+		int start = marker + 3;
+		int end = indexOfChar(literal, '>', start);
+		if (end == -1) {
+			return;
+		}
+		CharSequence iri = literal.subSequence(start, end);
+		if (!isAbsoluteIri(iri)) {
+			throw new IllegalArgumentException("Relative datatype IRI not allowed: " + iri);
+		}
+	}
+
+	private static boolean isIriToken(CharSequence value) {
+		if (value == null || value.length() == 0) {
+			return false;
+		}
+		char first = value.charAt(0);
+		if (first == '"') {
+			return false;
+		}
+		return !(first == '_' && value.length() > 1 && value.charAt(1) == ':');
+	}
+
+	private static int indexOfToken(CharSequence value, String token) {
+		int limit = value.length() - token.length();
+		for (int i = 0; i <= limit; i++) {
+			boolean matches = true;
+			for (int j = 0; j < token.length(); j++) {
+				if (value.charAt(i + j) != token.charAt(j)) {
+					matches = false;
+					break;
+				}
+			}
+			if (matches) {
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	private static int indexOfChar(CharSequence value, char token, int start) {
+		for (int i = start; i < value.length(); i++) {
+			if (value.charAt(i) == token) {
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	private static boolean isAbsoluteIri(CharSequence iri) {
+		int length = iri.length();
+		int colon = -1;
+		for (int i = 0; i < length; i++) {
+			char c = iri.charAt(i);
+			if (c == ':') {
+				colon = i;
+				break;
+			}
+			if (c == '/' || c == '?' || c == '#') {
+				return false;
+			}
+		}
+		if (colon <= 0) {
+			return false;
+		}
+		if (!isAsciiAlpha(iri.charAt(0))) {
+			return false;
+		}
+		for (int i = 1; i < colon; i++) {
+			char c = iri.charAt(i);
+			if (!(isAsciiAlpha(c) || isAsciiDigit(c) || c == '+' || c == '-' || c == '.')) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	private static boolean isAsciiAlpha(char c) {
+		return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+	}
+
+	private static boolean isAsciiDigit(char c) {
+		return c >= '0' && c <= '9';
 	}
 }
