@@ -5,13 +5,19 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * K-way merge over {@link ExceptionIterator}s using a loser tree.
+ * Optimized K-way merge using a Loser Tree.
  * <p>
- * Important: some qEndpoint readers reuse a single mutable object internally.
- * This iterator never advances a cursor before the previously returned element
- * has been handed to the caller.
+ * Optimizations: 1. Removed 'active' array (reduced cache pressure). Uses a
+ * SENTINEL object for exhausted streams. 2. Manually inlined comparison logic
+ * in hot paths (replayGames) to eliminate method call overhead. 3. Hoisted
+ * array references to local variables to prevent heap field dereferencing in
+ * loops. 4. Flattened control flow for better branch prediction.
  */
 public class LoserTreeMergeExceptionIterator<T, E extends Exception> implements ExceptionIterator<T, E> {
+
+	// Sentinel object to mark an exhausted iterator.
+	// We use this instead of a boolean[] active array to reduce memory lookups.
+	private static final Object SENTINEL = new Object();
 
 	public static <T, E extends Exception> ExceptionIterator<T, E> merge(
 			List<? extends ExceptionIterator<T, E>> sources, Comparator<? super T> comparator) {
@@ -28,14 +34,14 @@ public class LoserTreeMergeExceptionIterator<T, E extends Exception> implements 
 	private final long size;
 
 	private boolean initialized;
-
 	private int leafStart;
 	private ExceptionIterator<T, E>[] iterators;
-	private int[] tree;
-	private Object[] values;
-	private boolean[] active;
 
-	private int pendingAdvanceLeaf = -1;
+	// Flattened tree arrays
+	private int[] tree;
+	private Object[] values; // Contains T or SENTINEL
+
+	// State tracking
 	private int pendingReturnLeaf = -1;
 	private T next;
 
@@ -51,26 +57,37 @@ public class LoserTreeMergeExceptionIterator<T, E extends Exception> implements 
 		if (next != null) {
 			return true;
 		}
-		initializeIfNeeded();
 
+		// Fast-path: check initialization
+		if (!initialized) {
+			initialize();
+		}
+
+		// If tree is empty, we are done
 		if (tree.length == 0) {
 			return false;
 		}
 
-		if (pendingAdvanceLeaf != -1) {
-			advanceLeaf(pendingAdvanceLeaf);
-			replayGames(pendingAdvanceLeaf);
-			pendingAdvanceLeaf = -1;
+		// If we returned a value previously, we must advance that specific leaf
+		// and let it compete in the tournament again.
+		if (pendingReturnLeaf != -1) {
+			advanceAndReplay(pendingReturnLeaf);
+			pendingReturnLeaf = -1;
 		}
 
+		// The winner of the tournament is always at tree[0]
 		int winnerLeaf = tree[0];
-		if (winnerLeaf == -1 || !active[winnerLeaf]) {
+
+		// Check if the overall winner is actually the SENTINEL (all streams
+		// exhausted)
+		Object val = values[winnerLeaf];
+		if (val == SENTINEL) {
 			return false;
 		}
 
 		pendingReturnLeaf = winnerLeaf;
 		// noinspection unchecked
-		next = (T) values[winnerLeaf];
+		next = (T) val;
 		return true;
 	}
 
@@ -79,11 +96,8 @@ public class LoserTreeMergeExceptionIterator<T, E extends Exception> implements 
 		if (!hasNext()) {
 			return null;
 		}
-
 		T value = next;
 		next = null;
-		pendingAdvanceLeaf = pendingReturnLeaf;
-		pendingReturnLeaf = -1;
 		return value;
 	}
 
@@ -92,47 +106,174 @@ public class LoserTreeMergeExceptionIterator<T, E extends Exception> implements 
 		return size;
 	}
 
-	private void initializeIfNeeded() throws E {
-		if (initialized) {
-			return;
-		}
+	private void initialize() throws E {
 		initialized = true;
-
 		leafStart = sources.size();
+
 		if (leafStart == 0) {
-			// Ensure we never need to null-check fields later.
-			iterators = emptyIterators();
+			iterators = emptyIterators(0);
 			tree = new int[0];
 			values = new Object[0];
-			active = new boolean[0];
 			return;
 		}
 
 		iterators = emptyIterators(leafStart);
-		tree = new int[leafStart * 2];
-		values = new Object[leafStart * 2];
-		active = new boolean[leafStart * 2];
+		// Tree size is 2k. Indices 0..k-1 are internal nodes, k..2k-1 are
+		// leaves.
+		int arraySize = leafStart * 2;
+		tree = new int[arraySize];
+		values = new Object[arraySize];
 
+		// 1. Populate Leaves
 		for (int i = 0; i < leafStart; i++) {
 			ExceptionIterator<T, E> iterator = sources.get(i);
 			iterators[i] = iterator;
-			int leaf = leafStart + i;
-			if (iterator == null || !iterator.hasNext()) {
-				values[leaf] = null;
-				active[leaf] = false;
+			int leafIndex = leafStart + i;
+
+			if (iterator != null && iterator.hasNext()) {
+				values[leafIndex] = iterator.next();
+			} else {
+				values[leafIndex] = SENTINEL;
+			}
+		}
+
+		// 2. Build the Tournament Tree
+		// 'winners' is a temporary array needed only during initialization
+		// to track who moves up.
+		int[] winners = new int[arraySize];
+		for (int i = leafStart; i < arraySize; i++) {
+			winners[i] = i;
+		}
+
+		// Cache fields for the loop
+		final Object[] vals = this.values;
+		final Comparator<? super T> comp = this.comparator;
+		final int[] t = this.tree;
+
+		// Play matches from back to front
+		for (int i = arraySize - 2; i > 0; i -= 2) {
+			int right = winners[i + 1];
+			int left = winners[i];
+
+			int winner, loser;
+
+			// Inlined Comparison Logic (Left vs Right)
+			// We want the 'smaller' value to be the winner.
+			Object vLeft = vals[left];
+			Object vRight = vals[right];
+
+			boolean leftWins;
+			if (vLeft == SENTINEL) {
+				leftWins = false; // Left is exhausted, Right wins (even if
+									// Right is also SENTINEL, doesn't matter)
+			} else if (vRight == SENTINEL) {
+				leftWins = true; // Right exhausted, Left wins
+			} else {
+				// Both are active, use Comparator
+				// noinspection unchecked
+				int c = comp.compare((T) vLeft, (T) vRight);
+				if (c != 0) {
+					leftWins = c < 0;
+				} else {
+					// Stability: lower index wins ties
+					leftWins = left < right;
+				}
+			}
+
+			if (leftWins) {
+				winner = left;
+				loser = right;
+			} else {
+				winner = right;
+				loser = left;
+			}
+
+			int parent = i >>> 1;
+			t[parent] = loser; // Internal node stores the loser
+			winners[parent] = winner; // Winner advances
+		}
+
+		t[0] = winners[1];
+	}
+
+	/**
+	 * Advances the specific leaf and replays the game up the tree. Combined
+	 * method to reduce overhead.
+	 */
+	private void advanceAndReplay(int leaf) throws E {
+		// 1. Advance the iterator for this leaf
+		int sourceIndex = leaf - leafStart;
+		ExceptionIterator<T, E> it = iterators[sourceIndex];
+
+		if (it.hasNext()) {
+			values[leaf] = it.next();
+		} else {
+			values[leaf] = SENTINEL;
+		}
+
+		// 2. Replay Games (Hot Path)
+		// We lift fields to local variables for speed (Register allocation)
+		final int[] t = this.tree;
+		final Object[] vals = this.values;
+		final Comparator<? super T> comp = this.comparator;
+
+		int currentWinner = leaf;
+		Object currentVal = vals[leaf];
+
+		// Traverse from leaf to root
+		for (int node = leaf >>> 1; node != 0; node >>>= 1) {
+			int challenger = t[node]; // The loser stored at this node
+
+			// Optimization: If the current winner is SENTINEL, it loses against
+			// everyone
+			// (except another SENTINEL, but logic handles that naturally).
+			// We can skip comparison logic if we know the result is fixed.
+			if (currentVal == SENTINEL) {
+				// Current is exhausted (Infinity). It loses.
+				// The challenger wins and moves up. We stay as the loser.
+				t[node] = currentWinner;
+				currentWinner = challenger;
+				currentVal = vals[challenger];
 				continue;
 			}
 
-			values[leaf] = iterator.next();
-			active[leaf] = true;
+			Object challengerVal = vals[challenger];
+
+			// If challenger is SENTINEL, Current wins automatically.
+			if (challengerVal == SENTINEL) {
+				// Current wins. Challenger stays as loser.
+				// Loop continues with currentWinner unchanged.
+				continue;
+			}
+
+			// Both are active. Compare.
+			// Check if Challenger is BETTER than Current.
+			// If Challenger < Current, Challenger wins.
+			// noinspection unchecked
+			int c = comp.compare((T) challengerVal, (T) currentVal);
+
+			boolean challengerWins = false;
+			if (c < 0) {
+				challengerWins = true;
+			} else if (c == 0) {
+				// Stability check: Lower index wins.
+				// If Challenger index < Current index, Challenger wins.
+				challengerWins = challenger < currentWinner;
+			}
+
+			if (challengerWins) {
+				// Challenger wins.
+				// Current winner becomes the loser and is stored at this node.
+				t[node] = currentWinner;
+
+				// Challenger becomes the new winner bubbling up.
+				currentWinner = challenger;
+				currentVal = challengerVal;
+			}
+			// Else: Current wins, Challenger stays as loser. Loop continues.
 		}
 
-		initializeTree();
-	}
-
-	@SuppressWarnings("unchecked")
-	private ExceptionIterator<T, E>[] emptyIterators() {
-		return (ExceptionIterator<T, E>[]) new ExceptionIterator[0];
+		t[0] = currentWinner;
 	}
 
 	@SuppressWarnings("unchecked")
@@ -140,90 +281,14 @@ public class LoserTreeMergeExceptionIterator<T, E extends Exception> implements 
 		return (ExceptionIterator<T, E>[]) new ExceptionIterator[size];
 	}
 
-	private void initializeTree() {
-		int[] winners = new int[tree.length];
-		// Initialize leaf nodes as winners to start.
-		for (int i = leafStart; i < tree.length; i++) {
-			winners[i] = i;
-		}
-		for (int i = tree.length - 2; i > 0; i -= 2) {
-			int a = winners[i];
-			int b = winners[i + 1];
-			int loser;
-			int winner;
-			if (less(a, b)) {
-				winner = a;
-				loser = b;
-			} else {
-				winner = b;
-				loser = a;
-			}
-
-			int p = i >>> 1;
-			tree[p] = loser;
-			winners[p] = winner;
-		}
-		tree[0] = winners[1];
-	}
-
-	private void replayGames(int leaf) {
-		for (int node = leaf >>> 1; node != 0; node >>>= 1) {
-			int loser = tree[node];
-			if (less(loser, leaf)) {
-				tree[node] = leaf;
-				leaf = loser;
-			}
-		}
-
-		tree[0] = leaf;
-	}
-
-	/**
-	 * Advance the leaf, marking it inactive when exhausted.
-	 */
-	private void advanceLeaf(int leaf) throws E {
-		int sourceIndex = leaf - leafStart;
-		ExceptionIterator<T, E> iterator = iterators[sourceIndex];
-		if (iterator != null && iterator.hasNext()) {
-			values[leaf] = iterator.next();
-			active[leaf] = true;
-			return;
-		}
-
-		values[leaf] = null;
-		active[leaf] = false;
-	}
-
-	@SuppressWarnings("unchecked")
-	private boolean less(int a, int b) {
-		boolean aActive = active[a];
-		boolean bActive = active[b];
-
-		if (!aActive) {
-			return false;
-		}
-		if (!bActive) {
-			return true;
-		}
-
-		int compare = comparator.compare((T) values[a], (T) values[b]);
-		if (compare != 0) {
-			return compare < 0;
-		}
-		// Stable tie-break: preserve original source order.
-		return a < b;
-	}
-
 	private static <T, E extends Exception> long computeSize(List<? extends ExceptionIterator<T, E>> sources) {
 		long size = 0;
 		for (ExceptionIterator<T, E> source : sources) {
-			if (source == null) {
+			if (source == null)
 				continue;
-			}
 			long s = source.getSize();
-			if (s == -1) {
+			if (s == -1)
 				return -1;
-			}
 			size += s;
 		}
 		return size;

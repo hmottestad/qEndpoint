@@ -255,7 +255,7 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 				}
 				CloseSuppressPath file = root.resolve(bucketFileName(bucket));
 				try (OutputStream out = new BufferedOutputStream(Files.newOutputStream(file, StandardOpenOption.CREATE,
-						StandardOpenOption.WRITE, StandardOpenOption.APPEND), IO_BUFFER_BYTES)) {
+						StandardOpenOption.WRITE, StandardOpenOption.APPEND))) {
 					writeRecords(out, sortedOffsets, sortedHeaders, start, end);
 				}
 			}

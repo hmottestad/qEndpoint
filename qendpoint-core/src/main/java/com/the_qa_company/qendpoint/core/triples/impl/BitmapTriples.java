@@ -841,8 +841,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 							// Sort by objectValue to optimize select1.
 							// Parallel sort is stable, keeping originalIndex
 							// order for identical values.
-							java.util.Arrays.parallelSort(batch, 0, batchPtr,
-									(o1, o2) -> Long.compare(o1.objectValue, o2.objectValue));
+							Arrays.parallelSort(batch, 0, batchPtr, Comparator.comparingLong(o -> o.objectValue));
 
 							for (int k = 0; k < batchPtr; k++) {
 								BatchEntry e = batch[k];
