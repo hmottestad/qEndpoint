@@ -207,6 +207,302 @@ public class SequenceLog64BigDisk implements DynamicSequence, Closeable {
 		setField(data, numbits, position, value);
 	}
 
+	public void set(long[] positions, long[] values, int offset, int length) {
+		if (length <= 0) {
+			return;
+		}
+		if (positions == null || values == null) {
+			throw new NullPointerException();
+		}
+		if (offset < 0 || length < 0 || offset + length > positions.length || offset + length > values.length) {
+			throw new IndexOutOfBoundsException();
+		}
+
+		if (numbits == 0) {
+			return;
+		}
+		if (numbits >= 64 || !(data instanceof LongArrayDisk disk)) {
+			for (int i = offset; i < offset + length; i++) {
+				set(positions[i], values[i]);
+			}
+			return;
+		}
+
+		sortPairsByKey(positions, values, offset, offset + length);
+
+		long[] run = getBulkWriteRunBuffer(length);
+		long runStart = -1;
+		int runLength = 0;
+		long runLastIndex = -1;
+
+		long currentWordIndex = -1;
+		long currentWordValue = 0;
+		boolean currentDirty = false;
+
+		long nextWordIndex = -1;
+		long nextWordValue = 0;
+		boolean nextDirty = false;
+
+		for (int i = offset; i < offset + length; i++) {
+			long position = positions[i];
+			long value = values[i];
+
+			if (value < 0 || value > maxvalue) {
+				throw new IllegalArgumentException(
+						"Value exceeds the maximum for this data structure " + value + " > " + maxvalue);
+			}
+
+			long bitPos = position * (long) numbits;
+			long wordIndex = bitPos >>> 6;
+			int bitOffset = (int) (bitPos & 63);
+
+			if (wordIndex == nextWordIndex) {
+				if (currentDirty) {
+					if (runLength == 0) {
+						runStart = currentWordIndex;
+						runLastIndex = currentWordIndex;
+						run[0] = currentWordValue;
+						runLength = 1;
+					} else if (currentWordIndex == runLastIndex + 1) {
+						if (runLength == run.length) {
+							disk.set(runStart, run, 0, runLength);
+							runStart = currentWordIndex;
+							runLastIndex = currentWordIndex;
+							run[0] = currentWordValue;
+							runLength = 1;
+						} else {
+							run[runLength++] = currentWordValue;
+							runLastIndex = currentWordIndex;
+						}
+					} else {
+						disk.set(runStart, run, 0, runLength);
+						runStart = currentWordIndex;
+						runLastIndex = currentWordIndex;
+						run[0] = currentWordValue;
+						runLength = 1;
+					}
+				}
+				currentWordIndex = nextWordIndex;
+				currentWordValue = nextWordValue;
+				currentDirty = nextDirty;
+				nextWordIndex = -1;
+				nextDirty = false;
+			} else if (wordIndex != currentWordIndex) {
+				if (currentDirty) {
+					if (runLength == 0) {
+						runStart = currentWordIndex;
+						runLastIndex = currentWordIndex;
+						run[0] = currentWordValue;
+						runLength = 1;
+					} else if (currentWordIndex == runLastIndex + 1) {
+						if (runLength == run.length) {
+							disk.set(runStart, run, 0, runLength);
+							runStart = currentWordIndex;
+							runLastIndex = currentWordIndex;
+							run[0] = currentWordValue;
+							runLength = 1;
+						} else {
+							run[runLength++] = currentWordValue;
+							runLastIndex = currentWordIndex;
+						}
+					} else {
+						disk.set(runStart, run, 0, runLength);
+						runStart = currentWordIndex;
+						runLastIndex = currentWordIndex;
+						run[0] = currentWordValue;
+						runLength = 1;
+					}
+				}
+				if (nextDirty) {
+					if (runLength == 0) {
+						runStart = nextWordIndex;
+						runLastIndex = nextWordIndex;
+						run[0] = nextWordValue;
+						runLength = 1;
+					} else if (nextWordIndex == runLastIndex + 1) {
+						if (runLength == run.length) {
+							disk.set(runStart, run, 0, runLength);
+							runStart = nextWordIndex;
+							runLastIndex = nextWordIndex;
+							run[0] = nextWordValue;
+							runLength = 1;
+						} else {
+							run[runLength++] = nextWordValue;
+							runLastIndex = nextWordIndex;
+						}
+					} else {
+						disk.set(runStart, run, 0, runLength);
+						runStart = nextWordIndex;
+						runLastIndex = nextWordIndex;
+						run[0] = nextWordValue;
+						runLength = 1;
+					}
+					nextWordIndex = -1;
+					nextDirty = false;
+				}
+				currentWordIndex = wordIndex;
+				currentWordValue = disk.get(wordIndex);
+				currentDirty = false;
+				nextWordIndex = -1;
+				nextDirty = false;
+			}
+
+			final int endBit = bitOffset + numbits;
+			long mask = ~(~0L << numbits) << bitOffset;
+			currentWordValue = (currentWordValue & ~mask) | (value << bitOffset);
+			currentDirty = true;
+
+			if (endBit > W) {
+				long spillIndex = wordIndex + 1;
+				if (nextWordIndex != spillIndex) {
+					if (nextDirty) {
+						if (runLength == 0) {
+							runStart = nextWordIndex;
+							runLastIndex = nextWordIndex;
+							run[0] = nextWordValue;
+							runLength = 1;
+						} else if (nextWordIndex == runLastIndex + 1) {
+							if (runLength == run.length) {
+								disk.set(runStart, run, 0, runLength);
+								runStart = nextWordIndex;
+								runLastIndex = nextWordIndex;
+								run[0] = nextWordValue;
+								runLength = 1;
+							} else {
+								run[runLength++] = nextWordValue;
+								runLastIndex = nextWordIndex;
+							}
+						} else {
+							disk.set(runStart, run, 0, runLength);
+							runStart = nextWordIndex;
+							runLastIndex = nextWordIndex;
+							run[0] = nextWordValue;
+							runLength = 1;
+						}
+					}
+					nextWordIndex = spillIndex;
+					nextWordValue = disk.get(spillIndex);
+					nextDirty = false;
+				}
+
+				long nextMask = ~0L << (numbits + bitOffset - W);
+				nextWordValue = (nextWordValue & nextMask) | (value >>> (W - bitOffset));
+				nextDirty = true;
+			}
+		}
+
+		if (currentDirty) {
+			if (runLength == 0) {
+				runStart = currentWordIndex;
+				runLastIndex = currentWordIndex;
+				run[0] = currentWordValue;
+				runLength = 1;
+			} else if (currentWordIndex == runLastIndex + 1) {
+				if (runLength == run.length) {
+					disk.set(runStart, run, 0, runLength);
+					runStart = currentWordIndex;
+					runLastIndex = currentWordIndex;
+					run[0] = currentWordValue;
+					runLength = 1;
+				} else {
+					run[runLength++] = currentWordValue;
+					runLastIndex = currentWordIndex;
+				}
+			} else {
+				disk.set(runStart, run, 0, runLength);
+				runStart = currentWordIndex;
+				runLastIndex = currentWordIndex;
+				run[0] = currentWordValue;
+				runLength = 1;
+			}
+		}
+		if (nextDirty) {
+			if (runLength == 0) {
+				runStart = nextWordIndex;
+				runLastIndex = nextWordIndex;
+				run[0] = nextWordValue;
+				runLength = 1;
+			} else if (nextWordIndex == runLastIndex + 1) {
+				if (runLength == run.length) {
+					disk.set(runStart, run, 0, runLength);
+					runStart = nextWordIndex;
+					runLastIndex = nextWordIndex;
+					run[0] = nextWordValue;
+					runLength = 1;
+				} else {
+					run[runLength++] = nextWordValue;
+					runLastIndex = nextWordIndex;
+				}
+			} else {
+				disk.set(runStart, run, 0, runLength);
+				runStart = nextWordIndex;
+				runLastIndex = nextWordIndex;
+				run[0] = nextWordValue;
+				runLength = 1;
+			}
+		}
+
+		if (runLength > 0) {
+			disk.set(runStart, run, 0, runLength);
+		}
+	}
+
+	private static final ThreadLocal<long[]> BULK_WRITE_RUN_BUFFER = ThreadLocal.withInitial(() -> new long[4096]);
+
+	private static long[] getBulkWriteRunBuffer(int fieldCount) {
+		int required = Math.max(16, fieldCount * 2 + 2);
+		long[] buffer = BULK_WRITE_RUN_BUFFER.get();
+		if (buffer.length >= required) {
+			return buffer;
+		}
+
+		int newSize = 1;
+		while (newSize < required) {
+			newSize <<= 1;
+		}
+		buffer = new long[newSize];
+		BULK_WRITE_RUN_BUFFER.set(buffer);
+		return buffer;
+	}
+
+	private static void sortPairsByKey(long[] keys, long[] values, int from, int to) {
+		int left = from;
+		int right = to - 1;
+		if (left >= right) {
+			return;
+		}
+
+		long pivot = keys[left + ((right - left) >>> 1)];
+		int i = left;
+		int j = right;
+		while (i <= j) {
+			while (keys[i] < pivot) {
+				i++;
+			}
+			while (keys[j] > pivot) {
+				j--;
+			}
+			if (i <= j) {
+				long tmpKey = keys[i];
+				keys[i] = keys[j];
+				keys[j] = tmpKey;
+
+				long tmpVal = values[i];
+				values[i] = values[j];
+				values[j] = tmpVal;
+
+				i++;
+				j--;
+			}
+		}
+		if (from < j + 1) {
+			sortPairsByKey(keys, values, from, j + 1);
+		}
+		if (i < to) {
+			sortPairsByKey(keys, values, i, to);
+		}
+	}
+
 	@Override
 	public int sizeOf() {
 		return numbits;
