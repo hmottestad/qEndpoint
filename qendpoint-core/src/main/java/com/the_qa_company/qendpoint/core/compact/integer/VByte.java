@@ -45,6 +45,14 @@ public class VByte {
 	private VByte() {
 	}
 
+	public interface FastInput {
+		long readVByteLong() throws IOException;
+	}
+
+	public interface FastOutput {
+		void writeVByteLong(long value) throws IOException;
+	}
+
 	/**
 	 * encode a Variable-Byte adding a bit for the sign, should be decoded with
 	 * {@link #decodeSigned(InputStream)}
@@ -85,6 +93,10 @@ public class VByte {
 		if (value < 0) {
 			throw new IllegalArgumentException("Only can encode VByte of positive values");
 		}
+		if (out instanceof FastOutput) {
+			((FastOutput) out).writeVByteLong(value);
+			return;
+		}
 		while (value > 127) {
 			out.write((int) (value & 127));
 			value >>>= 7;
@@ -111,6 +123,9 @@ public class VByte {
 	}
 
 	public static long decode(InputStream in) throws IOException {
+		if (in instanceof FastInput) {
+			return ((FastInput) in).readVByteLong();
+		}
 		long out = 0;
 		int shift = 0;
 		long readbyte = in.read();

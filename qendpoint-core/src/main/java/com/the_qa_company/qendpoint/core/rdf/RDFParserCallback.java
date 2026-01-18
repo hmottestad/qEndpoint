@@ -58,4 +58,9 @@ public interface RDFParserCallback {
 
 	void doParse(InputStream in, String baseUri, RDFNotation notation, boolean keepBNode, RDFCallback callback)
 			throws ParserException;
+
+	default void doParse(InputStream in, String baseUri, RDFNotation notation, boolean keepBNode, RDFCallback callback,
+			boolean parallel) throws ParserException {
+		doParse(in, baseUri, notation, keepBNode, callback);
+	}
 }

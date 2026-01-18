@@ -41,8 +41,8 @@ import com.the_qa_company.qendpoint.core.hdt.impl.diskindex.ObjectAdjReader;
 import com.the_qa_company.qendpoint.core.header.Header;
 import com.the_qa_company.qendpoint.core.iterator.SequentialSearchIteratorTripleID;
 import com.the_qa_company.qendpoint.core.iterator.SuppliableIteratorTripleID;
-import com.the_qa_company.qendpoint.core.iterator.utils.AsyncIteratorFetcher;
 import com.the_qa_company.qendpoint.core.iterator.utils.ExceptionIterator;
+import com.the_qa_company.qendpoint.core.iterator.utils.IteratorChunkedSource;
 import com.the_qa_company.qendpoint.core.listener.MultiThreadListener;
 import com.the_qa_company.qendpoint.core.listener.ProgressListener;
 import com.the_qa_company.qendpoint.core.options.ControlInfo;
@@ -619,9 +619,9 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		}
 
 		// start the indexing
-		DiskIndexSort sort = new DiskIndexSort(CloseSuppressPath.of(diskLocation).resolve("chunks"),
-				new AsyncIteratorFetcher<>(new ObjectAdjReader(seqZ, seqY, bitmapZ)), listener, bufferSize, chunkSize,
-				k, Comparator.<Pair>comparingLong(p -> p.object).thenComparingLong(p -> p.predicate));
+		DiskIndexSort sort = new DiskIndexSort(CloseSuppressPath.of(diskLocation).resolve("chunks"), listener,
+				bufferSize, chunkSize, k,
+				Comparator.<Pair>comparingLong(p -> p.object).thenComparingLong(p -> p.predicate));
 
 		// Serialize
 		DynamicSequence indexZ = null;
@@ -632,7 +632,11 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 
 		try {
 			try {
-				ExceptionIterator<Pair, IOException> sortedPairs = sort.sort(workers);
+				ExceptionIterator<Pair, IOException> sortedPairs;
+				try (IteratorChunkedSource<Pair> chunkSource = IteratorChunkedSource.of(
+						new ObjectAdjReader(seqZ, seqY, bitmapZ), p -> 3L * Long.BYTES, Math.max(1, chunkSize), null)) {
+					sortedPairs = sort.sortPull(workers, chunkSource);
+				}
 
 				log.info("Pair sorted in {}", global.stopAndShow());
 
@@ -727,7 +731,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		log.info("Index generated in {}", global.stopAndShow());
 	}
 
-	private void createIndexObjectMemoryEfficient() throws IOException {
+	private void createIndexObjectMemoryEfficient(ProgressListener listener) throws IOException {
 		Path diskLocation;
 		if (diskSequence) {
 			diskLocation = diskSequenceLocation.createOrGetPath();
@@ -737,6 +741,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 
 		StopWatch global = new StopWatch();
 		StopWatch st = new StopWatch();
+		ProgressListener progressListener = ProgressListener.ofNullable(listener);
 
 		// Count the number of appearances of each object
 		long maxCount = 0;
@@ -792,15 +797,22 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 					BitUtil.log2(maxCount), numDifferentObjects)) {
 				objectInsertedCount.resize(numDifferentObjects);
 
-				for (long i = 0; i < seqZ.getNumberOfElements(); i++) {
-					long objectValue = seqZ.get(i);
-					long posY = i > 0 ? bitmapZ.rank1(i - 1) : 0;
+				int bucketSize = BucketedSequenceWriter.resolveObjectIndexBucketSize(seqZ.getNumberOfElements());
+				int bufferRecords = BucketedSequenceWriter.resolveObjectIndexBufferRecords(seqZ.getNumberOfElements(),
+						bucketSize);
+				try (BucketedSequenceWriter writer = BucketedSequenceWriter.create(diskLocation,
+						"bitmapTriples-objectIndexBuckets", seqZ.getNumberOfElements(), bucketSize, bufferRecords)) {
+					for (long i = 0; i < seqZ.getNumberOfElements(); i++) {
+						long objectValue = seqZ.get(i);
+						long posY = i > 0 ? bitmapZ.rank1(i - 1) : 0;
 
-					long insertBase = objectValue == 1 ? 0 : bitmapIndex.select1(objectValue - 1) + 1;
-					long insertOffset = objectInsertedCount.get(objectValue - 1);
-					objectInsertedCount.set(objectValue - 1, insertOffset + 1);
+						long insertBase = objectValue == 1 ? 0 : bitmapIndex.select1(objectValue - 1) + 1;
+						long insertOffset = objectInsertedCount.get(objectValue - 1);
+						objectInsertedCount.set(objectValue - 1, insertOffset + 1);
 
-					objectArray.set(insertBase + insertOffset, posY);
+						writer.add(insertBase + insertOffset, posY);
+					}
+					writer.materializeTo(objectArray, progressListener);
 				}
 				log.info("Object references in {}", st.stopAndShow());
 			}
@@ -1015,7 +1027,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		switch (indexMethod) {
 		case HDTOptionsKeys.BITMAPTRIPLES_INDEX_METHOD_VALUE_RECOMMENDED,
 				HDTOptionsKeys.BITMAPTRIPLES_INDEX_METHOD_VALUE_OPTIMIZED ->
-			createIndexObjectMemoryEfficient();
+			createIndexObjectMemoryEfficient(listener);
 		case HDTOptionsKeys.BITMAPTRIPLES_INDEX_METHOD_VALUE_DISK ->
 			createIndexObjectDisk(specIndex, dictionary, listener);
 		case HDTOptionsKeys.BITMAPTRIPLES_INDEX_METHOD_VALUE_LEGACY -> createIndexObjects();
