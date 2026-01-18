@@ -802,16 +802,80 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 						bucketSize);
 				try (BucketedSequenceWriter writer = BucketedSequenceWriter.create(diskLocation,
 						"bitmapTriples-objectIndexBuckets", seqZ.getNumberOfElements(), bucketSize, bufferRecords)) {
+
+					// --- START OPTIMIZATION ---
+
+					// 1. Definition of the Batch Entry
+					class BatchEntry {
+						long originalIndex;
+						long objectValue;
+						long posY;
+					}
+
+					// 2. Setup Batching (128k)
+					final int BATCH_SIZE = 128 * 1024;
+					BatchEntry[] batch = new BatchEntry[BATCH_SIZE];
+					// Pre-allocate objects to avoid garbage collection churn in
+					// the loop
+					for (int k = 0; k < BATCH_SIZE; k++) {
+						batch[k] = new BatchEntry();
+					}
+					int batchPtr = 0;
+
+					// 3. Main Loop
 					for (long i = 0; i < seqZ.getNumberOfElements(); i++) {
 						long objectValue = seqZ.get(i);
+
+						// Vital: Calculate posY NOW while 'i' is sequential.
+						// This keeps bitmapZ.rank1 fast.
 						long posY = i > 0 ? bitmapZ.rank1(i - 1) : 0;
 
-						long insertBase = objectValue == 1 ? 0 : bitmapIndex.select1(objectValue - 1) + 1;
-						long insertOffset = objectInsertedCount.get(objectValue - 1);
-						objectInsertedCount.set(objectValue - 1, insertOffset + 1);
+						// Fill batch
+						BatchEntry entry = batch[batchPtr++];
+						entry.originalIndex = i;
+						entry.objectValue = objectValue;
+						entry.posY = posY;
 
-						writer.add(insertBase + insertOffset, posY);
+						// 4. Process Batch if full
+						if (batchPtr == BATCH_SIZE) {
+							// Sort by objectValue to optimize select1.
+							// Parallel sort is stable, keeping originalIndex
+							// order for identical values.
+							java.util.Arrays.parallelSort(batch, 0, batchPtr,
+									(o1, o2) -> Long.compare(o1.objectValue, o2.objectValue));
+
+							for (int k = 0; k < batchPtr; k++) {
+								BatchEntry e = batch[k];
+
+								// Since 'e.objectValue' is now ordered, select1
+								// is sequential/monotonic
+								long insertBase = e.objectValue == 1 ? 0 : bitmapIndex.select1(e.objectValue - 1) + 1;
+								long insertOffset = objectInsertedCount.get(e.objectValue - 1);
+								objectInsertedCount.set(e.objectValue - 1, insertOffset + 1);
+
+								writer.add(insertBase + insertOffset, e.posY);
+							}
+							batchPtr = 0;
+						}
 					}
+
+					// 5. Process Remaining Batch
+					if (batchPtr > 0) {
+						java.util.Arrays.parallelSort(batch, 0, batchPtr,
+								(o1, o2) -> Long.compare(o1.objectValue, o2.objectValue));
+
+						for (int k = 0; k < batchPtr; k++) {
+							BatchEntry e = batch[k];
+
+							long insertBase = e.objectValue == 1 ? 0 : bitmapIndex.select1(e.objectValue - 1) + 1;
+							long insertOffset = objectInsertedCount.get(e.objectValue - 1);
+							objectInsertedCount.set(e.objectValue - 1, insertOffset + 1);
+
+							writer.add(insertBase + insertOffset, e.posY);
+						}
+					}
+					// --- END OPTIMIZATION ---
+
 					writer.materializeTo(objectArray, progressListener);
 				}
 				log.info("Object references in {}", st.stopAndShow());
