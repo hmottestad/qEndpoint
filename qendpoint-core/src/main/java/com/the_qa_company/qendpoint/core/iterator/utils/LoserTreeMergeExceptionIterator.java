@@ -33,6 +33,7 @@ public class LoserTreeMergeExceptionIterator<T, E extends Exception> implements 
 	private ExceptionIterator<T, E>[] iterators;
 	private int[] tree;
 	private Object[] values;
+	private boolean[] active;
 
 	private int pendingAdvanceLeaf = -1;
 	private int pendingReturnLeaf = -1;
@@ -57,16 +58,13 @@ public class LoserTreeMergeExceptionIterator<T, E extends Exception> implements 
 		}
 
 		if (pendingAdvanceLeaf != -1) {
-			if (advanceLeaf(pendingAdvanceLeaf)) {
-				replayGames(pendingAdvanceLeaf);
-			} else {
-				sequenceEnded(pendingAdvanceLeaf);
-			}
+			advanceLeaf(pendingAdvanceLeaf);
+			replayGames(pendingAdvanceLeaf);
 			pendingAdvanceLeaf = -1;
 		}
 
 		int winnerLeaf = tree[0];
-		if (winnerLeaf == -1 || tree[winnerLeaf] == -1) {
+		if (winnerLeaf == -1 || !active[winnerLeaf]) {
 			return false;
 		}
 
@@ -106,25 +104,27 @@ public class LoserTreeMergeExceptionIterator<T, E extends Exception> implements 
 			iterators = emptyIterators();
 			tree = new int[0];
 			values = new Object[0];
+			active = new boolean[0];
 			return;
 		}
 
 		iterators = emptyIterators(leafStart);
 		tree = new int[leafStart * 2];
 		values = new Object[leafStart * 2];
+		active = new boolean[leafStart * 2];
 
 		for (int i = 0; i < leafStart; i++) {
 			ExceptionIterator<T, E> iterator = sources.get(i);
 			iterators[i] = iterator;
 			int leaf = leafStart + i;
 			if (iterator == null || !iterator.hasNext()) {
-				tree[leaf] = -1;
 				values[leaf] = null;
+				active[leaf] = false;
 				continue;
 			}
 
-			tree[leaf] = leaf;
 			values[leaf] = iterator.next();
+			active[leaf] = true;
 		}
 
 		initializeTree();
@@ -161,69 +161,43 @@ public class LoserTreeMergeExceptionIterator<T, E extends Exception> implements 
 
 			int p = i >>> 1;
 			tree[p] = loser;
-			values[p] = values[loser];
 			winners[p] = winner;
 		}
 		tree[0] = winners[1];
-		values[0] = values[tree[0]];
 	}
 
 	private void replayGames(int leaf) {
 		for (int node = leaf >>> 1; node != 0; node >>>= 1) {
 			int loser = tree[node];
-			if (!less(loser, leaf)) {
-				continue;
+			if (less(loser, leaf)) {
+				tree[node] = leaf;
+				leaf = loser;
 			}
-
-			int oldWinner = leaf;
-			leaf = loser;
-			tree[node] = oldWinner;
-			values[node] = values[oldWinner];
 		}
 
 		tree[0] = leaf;
-		values[0] = values[leaf];
 	}
 
 	/**
-	 * @return {@code true} if the leaf is still active after advancing,
-	 *         {@code false} if it is exhausted.
+	 * Advance the leaf, marking it inactive when exhausted.
 	 */
-	private boolean advanceLeaf(int leaf) throws E {
+	private void advanceLeaf(int leaf) throws E {
 		int sourceIndex = leaf - leafStart;
 		ExceptionIterator<T, E> iterator = iterators[sourceIndex];
 		if (iterator != null && iterator.hasNext()) {
-			tree[leaf] = leaf;
 			values[leaf] = iterator.next();
-			return true;
-		}
-
-		tree[leaf] = -1;
-		values[leaf] = null;
-		return false;
-	}
-
-	private void sequenceEnded(int leaf) {
-		int node = leaf >>> 1;
-		while (node != 0 && tree[tree[node]] == -1) {
-			node >>>= 1;
-		}
-		if (node == 0) {
-			tree[0] = leaf;
-			values[0] = null;
+			active[leaf] = true;
 			return;
 		}
 
-		int winner = tree[node];
-		tree[node] = leaf;
-		values[node] = null;
-		replayGames(winner);
+		values[leaf] = null;
+		active[leaf] = false;
 	}
 
 	@SuppressWarnings("unchecked")
 	private boolean less(int a, int b) {
-		boolean aActive = tree[a] != -1;
-		boolean bActive = tree[b] != -1;
+		boolean aActive = active[a];
+		boolean bActive = active[b];
 
 		if (!aActive) {
 			return false;
