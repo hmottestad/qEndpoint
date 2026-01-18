@@ -106,28 +106,78 @@ public final class CRCStopBitOutputStream extends CRCOutputStream implements VBy
 			throw new IllegalArgumentException("Only can encode VByte of positive values");
 		}
 
-		final int bits = 64 - Long.numberOfLeadingZeros(value | 1L);
-		final int needed = (bits + 6) / 7;
-
-		if (buf.length - pos < needed) {
+		if (buf.length - pos < 9) {
 			flushBuffer();
 		}
 
 		final int start = pos;
-		long v = value;
+		int p = pos;
 
-		while (true) {
-			final int payload = (int) v & 0x7F;
-			v >>>= 7;
-			if (v == 0) {
-				buf[pos++] = (byte) (payload | 0x80);
-				break;
+		if (value < 0x80) {
+			// Byte 1 (0-7 bits)
+			buf[p++] = (byte) (value | 0x80);
+		} else {
+			buf[p++] = (byte) (value & 0x7F);
+			value >>>= 7;
+			if (value < 0x80) {
+				// Byte 2 (8-14 bits)
+				buf[p++] = (byte) (value | 0x80);
 			} else {
-				buf[pos++] = (byte) payload;
+				buf[p++] = (byte) (value & 0x7F);
+				value >>>= 7;
+				if (value < 0x80) {
+					// Byte 3 (15-21 bits)
+					buf[p++] = (byte) (value | 0x80);
+				} else {
+					buf[p++] = (byte) (value & 0x7F);
+					value >>>= 7;
+					if (value < 0x80) {
+						// Byte 4 (22-28 bits)
+						buf[p++] = (byte) (value | 0x80);
+					} else {
+						buf[p++] = (byte) (value & 0x7F);
+						value >>>= 7;
+						if (value < 0x80) {
+							// Byte 5 (29-35 bits)
+							buf[p++] = (byte) (value | 0x80);
+						} else {
+							buf[p++] = (byte) (value & 0x7F);
+							value >>>= 7;
+							if (value < 0x80) {
+								// Byte 6 (36-42 bits)
+								buf[p++] = (byte) (value | 0x80);
+							} else {
+								buf[p++] = (byte) (value & 0x7F);
+								value >>>= 7;
+								if (value < 0x80) {
+									// Byte 7 (43-49 bits)
+									buf[p++] = (byte) (value | 0x80);
+								} else {
+									buf[p++] = (byte) (value & 0x7F);
+									value >>>= 7;
+									if (value < 0x80) {
+										// Byte 8 (50-56 bits)
+										buf[p++] = (byte) (value | 0x80);
+									} else {
+										// Byte 9 (57-63 bits)
+										// A positive long uses at most 63 bits.
+										// We have shifted 56 bits (8 * 7).
+										// Remaining bits < 7.
+										// Therefore, the 9th byte is always the
+										// end.
+										buf[p++] = (byte) (value & 0x7F);
+										buf[p++] = (byte) ((value >>> 7) | 0x80);
+									}
+								}
+							}
+						}
+					}
+				}
 			}
 		}
 
-		updateCrcFromArray(buf, start, pos - start);
+		this.pos = p;
+		updateCrcFromArray(buf, start, p - start);
 	}
 
 	private void flushBuffer() throws IOException {
