@@ -1,15 +1,17 @@
 package com.the_qa_company.qendpoint.core.util.io.compress;
 
-import com.the_qa_company.qendpoint.core.exceptions.CRCException;
-import com.the_qa_company.qendpoint.core.triples.IndexedNode;
 import com.the_qa_company.qendpoint.core.utils.DebugOrderNodeIterator;
 import com.the_qa_company.qendpoint.core.compact.integer.VByte;
 import com.the_qa_company.qendpoint.core.iterator.utils.ExceptionIterator;
 import com.the_qa_company.qendpoint.core.iterator.utils.IndexNodeDeltaMergeExceptionIterator;
+import com.the_qa_company.qendpoint.core.iterator.utils.RangeAwareMergeExceptionIterator;
+import com.the_qa_company.qendpoint.core.exceptions.CRCException;
+import com.the_qa_company.qendpoint.core.triples.IndexedNode;
 import com.the_qa_company.qendpoint.core.util.crc.CRC32;
 import com.the_qa_company.qendpoint.core.util.crc.CRC8;
 import com.the_qa_company.qendpoint.core.util.crc.CRCInputStream;
 import com.the_qa_company.qendpoint.core.util.io.CRCStopBitInputStream;
+import com.the_qa_company.qendpoint.core.util.io.CloseSuppressPath;
 import com.the_qa_company.qendpoint.core.util.string.ReplazableString;
 
 import java.io.Closeable;
@@ -23,7 +25,8 @@ import java.util.function.Consumer;
  * @author Antoine Willerval
  */
 public class CompressNodeReader implements ExceptionIterator<IndexedNode, IOException>,
-		IndexNodeDeltaMergeExceptionIterator.IndexNodeDeltaFetcher<IOException>, Closeable {
+		IndexNodeDeltaMergeExceptionIterator.IndexNodeDeltaFetcher<IOException>, Closeable,
+		RangeAwareMergeExceptionIterator.RangedExceptionIterator<IndexedNode, IOException> {
 	private final CRCInputStream stream;
 	private final long size;
 	private long index;
@@ -32,8 +35,18 @@ public class CompressNodeReader implements ExceptionIterator<IndexedNode, IOExce
 	private final IndexedNode last;
 	private final ReplazableString tempString;
 	private final Consumer<IndexedNode> consumer;
+	private final RangeAwareMergeExceptionIterator.KeyRange<IndexedNode> range;
 
 	public CompressNodeReader(InputStream stream) throws IOException {
+		this(stream, null);
+	}
+
+	public CompressNodeReader(CloseSuppressPath path, int bufferSize) throws IOException {
+		this(path.openInputStream(bufferSize), CompressNodeRange.readRangeIfExists(path));
+	}
+
+	public CompressNodeReader(InputStream stream, RangeAwareMergeExceptionIterator.KeyRange<IndexedNode> range)
+			throws IOException {
 		this.stream = new CRCStopBitInputStream(stream, new CRC8());
 		this.size = VByte.decode(this.stream);
 		if (!this.stream.readCRCAndCheck()) {
@@ -43,6 +56,7 @@ public class CompressNodeReader implements ExceptionIterator<IndexedNode, IOExce
 		this.tempString = new ReplazableString();
 		this.last = new IndexedNode(tempString, -1);
 		consumer = DebugOrderNodeIterator.of("stream", true);
+		this.range = range;
 	}
 
 	@Override
@@ -105,6 +119,11 @@ public class CompressNodeReader implements ExceptionIterator<IndexedNode, IOExce
 	@Override
 	public boolean hasNext() throws IOException {
 		return index < size;
+	}
+
+	@Override
+	public RangeAwareMergeExceptionIterator.KeyRange<IndexedNode> keyRange() {
+		return range;
 	}
 
 	@Override

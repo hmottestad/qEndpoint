@@ -5,6 +5,7 @@ import com.the_qa_company.qendpoint.core.util.ParallelSortableArrayList;
 import com.the_qa_company.qendpoint.core.util.io.compress.Pair;
 import com.the_qa_company.qendpoint.core.util.io.compress.PairMergeIterator;
 import com.the_qa_company.qendpoint.core.util.io.compress.PairReader;
+import com.the_qa_company.qendpoint.core.util.io.compress.PairRange;
 import com.the_qa_company.qendpoint.core.util.io.compress.PairWriter;
 import com.the_qa_company.qendpoint.core.iterator.utils.AsyncIteratorFetcher;
 import com.the_qa_company.qendpoint.core.iterator.utils.ExceptionIterator;
@@ -82,6 +83,8 @@ public class DiskIndexSort implements KWayMerger.KWayMergerImpl<Pair, SizedSuppl
 		il.setRange(70, 100);
 		il.notifyProgress(0, "creating file");
 		try (PairWriter w = new PairWriter(output.openOutputStream(bufferSize), pairs.size())) {
+			Pair min = pairs.isEmpty() ? null : pairs.get(0).clone();
+			Pair max = pairs.isEmpty() ? null : pairs.get(pairs.size() - 1).clone();
 			// encode the size of the chunk
 			for (int i = 0; i < pairs.size(); i++) {
 				if (i % block == 0) {
@@ -90,6 +93,7 @@ public class DiskIndexSort implements KWayMerger.KWayMergerImpl<Pair, SizedSuppl
 				w.append(pairs.get(i));
 			}
 			listener.notifyProgress(100, "writing completed " + pairs.size() + " " + output.getFileName());
+			PairRange.writeRange(output, min, max);
 		} catch (IOException e) {
 			throw new KWayMerger.KWayMergerException("Can't write chunk", e);
 		}
@@ -104,7 +108,7 @@ public class DiskIndexSort implements KWayMerger.KWayMergerImpl<Pair, SizedSuppl
 			long count = 0;
 			try {
 				for (int i = 0; i < inputs.size(); i++) {
-					readers[i] = new PairReader(inputs.get(i).openInputStream(bufferSize));
+					readers[i] = new PairReader(inputs.get(i), bufferSize);
 				}
 
 				ExceptionIterator<Pair, IOException> it = PairMergeIterator.buildOfTree(readers, comparator);
@@ -112,14 +116,24 @@ public class DiskIndexSort implements KWayMerger.KWayMergerImpl<Pair, SizedSuppl
 				long rSize = it.getSize();
 				long size = Math.max(rSize, 1);
 				long block = size < 10 ? 1 : size / 10;
+				Pair min = null;
+				Pair max = null;
 				try (PairWriter w = new PairWriter(output.openOutputStream(bufferSize), rSize)) {
 					while (it.hasNext()) {
-						w.append(it.next());
+						Pair pair = it.next();
+						w.append(pair);
+						if (min == null) {
+							min = pair.clone();
+							max = pair.clone();
+						} else {
+							max.setAll(pair);
+						}
 						if (count % block == 0) {
 							listener.notifyProgress(count / (block / 10f), "merging pairs " + count + "/" + size);
 						}
 						count++;
 					}
+					PairRange.writeRange(output, min, max);
 				}
 			} finally {
 				IOUtil.closeAll(readers);
@@ -127,6 +141,9 @@ public class DiskIndexSort implements KWayMerger.KWayMergerImpl<Pair, SizedSuppl
 			listener.notifyProgress(100, "pairs merged " + output.getFileName() + " " + count);
 			// delete old pairs
 			IOUtil.closeAll(inputs);
+			for (CloseSuppressPath input : inputs) {
+				PairRange.deleteRangeIfExists(input);
+			}
 		} catch (IOException e) {
 			throw new KWayMerger.KWayMergerException(e);
 		}
@@ -163,13 +180,17 @@ public class DiskIndexSort implements KWayMerger.KWayMergerImpl<Pair, SizedSuppl
 			return ExceptionIterator.empty();
 		}
 		CloseSuppressPath path = sections.get();
-		return new PairReader(path.openInputStream(bufferSize)) {
+		return new PairReader(path, bufferSize) {
 			@Override
 			public void close() throws IOException {
 				try {
 					super.close();
 				} finally {
-					IOUtil.closeObject(path);
+					try {
+						IOUtil.closeObject(path);
+					} finally {
+						PairRange.deleteRangeIfExists(path);
+					}
 				}
 			}
 		};
@@ -187,13 +208,17 @@ public class DiskIndexSort implements KWayMerger.KWayMergerImpl<Pair, SizedSuppl
 			return ExceptionIterator.empty();
 		}
 		CloseSuppressPath path = sections.get();
-		return new PairReader(path.openInputStream(bufferSize)) {
+		return new PairReader(path, bufferSize) {
 			@Override
 			public void close() throws IOException {
 				try {
 					super.close();
 				} finally {
-					IOUtil.closeObject(path);
+					try {
+						IOUtil.closeObject(path);
+					} finally {
+						PairRange.deleteRangeIfExists(path);
+					}
 				}
 			}
 		};

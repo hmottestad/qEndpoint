@@ -15,6 +15,7 @@ import com.the_qa_company.qendpoint.core.util.io.CloseSuppressPath;
 import com.the_qa_company.qendpoint.core.util.io.IOUtil;
 import com.the_qa_company.qendpoint.core.util.io.compress.CompressTripleMergeIterator;
 import com.the_qa_company.qendpoint.core.util.io.compress.CompressTripleReader;
+import com.the_qa_company.qendpoint.core.util.io.compress.CompressTripleRange;
 import com.the_qa_company.qendpoint.core.util.io.compress.CompressTripleWriter;
 import com.the_qa_company.qendpoint.core.util.listener.IntermediateListener;
 
@@ -82,15 +83,25 @@ public class DiskTriplesReorderSorter implements KWayMerger.KWayMergerImpl<Tripl
 		IntermediateListener il = new IntermediateListener(listener);
 		il.setRange(70, 100);
 		il.notifyProgress(0, "creating file");
+		TripleID min = null;
+		TripleID max = null;
 		try (CompressTripleWriter w = new CompressTripleWriter(output.openOutputStream(bufferSize), false)) {
 			// encode the size of the chunk
 			for (int i = 0; i < pairs.size(); i++) {
-				w.appendTriple(pairs.get(i));
+				TripleID triple = pairs.get(i);
+				w.appendTriple(triple);
+				if (min == null) {
+					min = new TripleID(triple);
+					max = new TripleID(triple);
+				} else {
+					max.assign(triple);
+				}
 				if (i % block == 0) {
 					il.notifyProgress(i / (block / 10f), "writing triples " + count + "/" + pairs.size());
 				}
 			}
 			listener.notifyProgress(100, "writing completed " + pairs.size() + " " + output.getFileName());
+			CompressTripleRange.writeRange(output, min, max, false);
 		} catch (IOException e) {
 			throw new KWayMerger.KWayMergerException("Can't write chunk", e);
 		}
@@ -105,7 +116,7 @@ public class DiskTriplesReorderSorter implements KWayMerger.KWayMergerImpl<Tripl
 			long count = 0;
 			try {
 				for (int i = 0; i < inputs.size(); i++) {
-					readers[i] = new CompressTripleReader(inputs.get(i).openInputStream(bufferSize));
+					readers[i] = new CompressTripleReader(inputs.get(i), bufferSize);
 				}
 
 				// use spo because we are writing xyz
@@ -115,14 +126,24 @@ public class DiskTriplesReorderSorter implements KWayMerger.KWayMergerImpl<Tripl
 				long rSize = it.getSize();
 				long size = Math.max(rSize, 1);
 				long block = size < 10 ? 1 : size / 10;
+				TripleID min = null;
+				TripleID max = null;
 				try (CompressTripleWriter w = new CompressTripleWriter(output.openOutputStream(bufferSize), false)) {
 					while (it.hasNext()) {
-						w.appendTriple(it.next());
+						TripleID triple = it.next();
+						w.appendTriple(triple);
+						if (min == null) {
+							min = new TripleID(triple);
+							max = new TripleID(triple);
+						} else {
+							max.assign(triple);
+						}
 						if (count % block == 0) {
 							listener.notifyProgress(count / (block / 10f), "merging triples " + count + "/" + size);
 						}
 						count++;
 					}
+					CompressTripleRange.writeRange(output, min, max, false);
 				}
 			} finally {
 				IOUtil.closeAll(readers);
@@ -130,6 +151,9 @@ public class DiskTriplesReorderSorter implements KWayMerger.KWayMergerImpl<Tripl
 			listener.notifyProgress(100, "triples merged " + output.getFileName() + " " + count);
 			// delete old pairs
 			IOUtil.closeAll(inputs);
+			for (CloseSuppressPath input : inputs) {
+				CompressTripleRange.deleteRangeIfExists(input);
+			}
 		} catch (IOException e) {
 			throw new KWayMerger.KWayMergerException(e);
 		}
@@ -156,13 +180,17 @@ public class DiskTriplesReorderSorter implements KWayMerger.KWayMergerImpl<Tripl
 			return ExceptionIterator.empty();
 		}
 		CloseSuppressPath path = sections.get();
-		return new CompressTripleReader(path.openInputStream(bufferSize)) {
+		return new CompressTripleReader(path, bufferSize) {
 			@Override
 			public void close() throws IOException {
 				try {
 					super.close();
 				} finally {
-					IOUtil.closeObject(path);
+					try {
+						IOUtil.closeObject(path);
+					} finally {
+						CompressTripleRange.deleteRangeIfExists(path);
+					}
 				}
 			}
 		};
@@ -180,13 +208,17 @@ public class DiskTriplesReorderSorter implements KWayMerger.KWayMergerImpl<Tripl
 			return ExceptionIterator.empty();
 		}
 		CloseSuppressPath path = sections.get();
-		return new CompressTripleReader(path.openInputStream(bufferSize)) {
+		return new CompressTripleReader(path, bufferSize) {
 			@Override
 			public void close() throws IOException {
 				try {
 					super.close();
 				} finally {
-					IOUtil.closeObject(path);
+					try {
+						IOUtil.closeObject(path);
+					} finally {
+						CompressTripleRange.deleteRangeIfExists(path);
+					}
 				}
 			}
 		};

@@ -144,7 +144,7 @@ public class MergeExceptionIterator<T, E extends Exception> implements Exception
 		for (int i = start; i < end; i++) {
 			iterators.add(itFunction.apply(i, array.get(i)));
 		}
-		return LoserTreeMergeExceptionIterator.merge(iterators, comp);
+		return RangeAwareMergeExceptionIterator.merge(iterators, comp);
 	}
 
 	private final ExceptionIterator<T, E> in1, in2;

@@ -3,6 +3,7 @@ package com.the_qa_company.qendpoint.core.util.io.compress;
 import com.the_qa_company.qendpoint.core.listener.ProgressListener;
 import com.the_qa_company.qendpoint.core.triples.IndexedNode;
 import com.the_qa_company.qendpoint.core.iterator.utils.ExceptionIterator;
+import com.the_qa_company.qendpoint.core.iterator.utils.RangeAwareMergeExceptionIterator;
 import com.the_qa_company.qendpoint.core.util.string.ByteString;
 import com.the_qa_company.qendpoint.core.util.string.ReplazableString;
 
@@ -53,21 +54,37 @@ public class CompressUtil {
 	 */
 	public static void writeCompressedSection(ExceptionIterator<IndexedNode, IOException> it, long size,
 			OutputStream output, ProgressListener listener) throws IOException {
+		writeCompressedSectionWithRange(it, size, output, listener);
+	}
+
+	public static RangeAwareMergeExceptionIterator.KeyRange<IndexedNode> writeCompressedSectionWithRange(
+			ExceptionIterator<IndexedNode, IOException> it, long size, OutputStream output, ProgressListener listener)
+			throws IOException {
 		CompressNodeWriter writer = new CompressNodeWriter(output, size);
 		long element = 0;
 		long block = size < 10 ? 1 : size / 10;
+		IndexedNode first = null;
+		IndexedNode last = null;
 		while (it.hasNext()) {
 			if (listener != null && element % block == 0) {
 				listener.notifyProgress((float) (10 * element / block), "write section " + element + "/" + size);
 			}
-			writer.appendNode(it.next());
+			IndexedNode node = it.next();
+			writer.appendNode(node);
+			if (first == null) {
+				first = node.clone();
+			}
+			last = node;
 			element++;
 		}
-		it.forEachRemaining(writer::appendNode);
 		writer.writeCRC();
 		if (listener != null) {
 			listener.notifyProgress(100, "section completed " + size + " nodes");
 		}
+		if (first == null) {
+			return null;
+		}
+		return new RangeAwareMergeExceptionIterator.KeyRange<>(first, last.clone());
 	}
 
 	/**
