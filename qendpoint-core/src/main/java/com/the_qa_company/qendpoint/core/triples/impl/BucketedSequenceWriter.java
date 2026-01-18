@@ -188,7 +188,7 @@ final class BucketedSequenceWriter implements Closeable {
 			}
 			CloseSuppressPath file = root.resolve(bucketFileName(bucket));
 			try (OutputStream out = new BufferedOutputStream(Files.newOutputStream(file, StandardOpenOption.CREATE,
-					StandardOpenOption.WRITE, StandardOpenOption.APPEND), OBJECT_INDEX_IO_BUFFER_BYTES)) {
+					StandardOpenOption.WRITE, StandardOpenOption.APPEND))) {
 				writeRecords(out, sortedOffsets, sortedValues, start, end);
 			}
 		}
