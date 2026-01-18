@@ -10,15 +10,25 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
 import java.io.Closeable;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.channels.AsynchronousFileChannel;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Queue;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
 
 /**
  * Bucketed mapping sink for disk imports.
@@ -28,6 +38,8 @@ import java.util.Arrays;
  * headerId) records into per-bucket files. After dictionary construction,
  * {@link #materializeTo(CompressTripleMapper)} can be used to populate the
  * standard {@link CompressTripleMapper} mapping files sequentially.
+ * <p>
+ * Optimized to use NIO AsynchronousFileChannel and Buffer pooling.
  */
 public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeConsumer, Closeable {
 	private static final Logger log = LoggerFactory.getLogger(BucketedTripleMapper.class);
@@ -156,11 +168,22 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 		private final int[] bucketWriteCursor;
 		private final int[] sortedOffsets;
 		private final long[] sortedHeaders;
-		private final byte[] ioBuffer;
-		private final byte[] compressedBuffer;
-		private final byte[] chunkHeader;
+
+		// Compression / IO
+		private final byte[] ioBuffer; // Raw data accumulation buffer
+		private final byte[] chunkHeader; // Temp buffer for reading headers
+		private final byte[] compressedBuffer; // Temp buffer for reading
+												// compressed data
 		private final LZ4Compressor compressor;
 		private final LZ4FastDecompressor decompressor;
+
+		// NIO Caching
+		private final Map<Integer, AsynchronousFileChannel> channelCache = new HashMap<>();
+		private final long[] channelPositions;
+		// Pool of ByteBuffers for Async Writes.
+		// Size = Header + MaxCompressedSize
+		private final Queue<ByteBuffer> bufferPool = new ArrayDeque<>();
+		private final int bufferCapacity;
 
 		private RoleSpooler(CloseSuppressPath root, long tripleCount, int bucketSize, int bufferSize)
 				throws IOException {
@@ -193,9 +216,19 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 			LZ4Factory factory = LZ4Factory.fastestInstance();
 			compressor = factory.fastCompressor();
 			decompressor = factory.fastDecompressor();
+
 			ioBuffer = new byte[IO_BUFFER_BYTES];
-			compressedBuffer = new byte[compressor.maxCompressedLength(IO_BUFFER_BYTES)];
+			// Buffers for reading (materialize)
 			chunkHeader = new byte[CHUNK_HEADER_BYTES];
+			compressedBuffer = new byte[compressor.maxCompressedLength(IO_BUFFER_BYTES)];
+
+			// Setup Write Caching
+			channelPositions = new long[bucketCount];
+			Arrays.fill(channelPositions, -1); // -1 indicates not yet
+												// queried/opened
+
+			// Determine capacity for pooled write buffers
+			this.bufferCapacity = CHUNK_HEADER_BYTES + compressor.maxCompressedLength(IO_BUFFER_BYTES);
 		}
 
 		private void add(long tripleId, long headerId) {
@@ -229,6 +262,7 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 				return;
 			}
 
+			// 1. Sort the bucket buffers (CPU bound)
 			Arrays.fill(bucketCounts, 0);
 			for (int i = 0; i < size; i++) {
 				bucketCounts[bucketBuffer[i]]++;
@@ -247,23 +281,147 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 				sortedHeaders[outIndex] = headerBuffer[i];
 			}
 
-			for (int bucket = 0; bucket < bucketCount; bucket++) {
-				int start = bucketOffsets[bucket];
-				int end = bucketOffsets[bucket + 1];
-				if (start == end) {
-					continue;
+			// 2. Async Write Phase
+			List<Future<Integer>> pendingWrites = new ArrayList<>();
+			List<ByteBuffer> buffersInUse = new ArrayList<>();
+
+			try {
+				for (int bucket = 0; bucket < bucketCount; bucket++) {
+					int start = bucketOffsets[bucket];
+					int end = bucketOffsets[bucket + 1];
+					if (start == end) {
+						continue;
+					}
+
+					// Prepare to write records for this bucket
+					AsynchronousFileChannel channel = getChannel(bucket);
+
+					int pos = 0; // Position in ioBuffer (raw bytes)
+					for (int i = start; i < end; i++) {
+						// Check if ioBuffer is full
+						if (ioBuffer.length - pos < RECORD_BYTES) {
+							// Flush current chunk
+							ByteBuffer writeBuffer = acquireBuffer();
+							buffersInUse.add(writeBuffer);
+							int bytesWritten = prepareCompressedBuffer(writeBuffer, ioBuffer, pos);
+
+							long filePos = channelPositions[bucket];
+							pendingWrites.add(channel.write(writeBuffer, filePos));
+							channelPositions[bucket] += bytesWritten;
+
+							pos = 0;
+						}
+
+						// Fill ioBuffer
+						putInt(ioBuffer, pos, sortedOffsets[i]);
+						pos += Integer.BYTES;
+						putLong(ioBuffer, pos, sortedHeaders[i]);
+						pos += Long.BYTES;
+					}
+
+					// Flush remaining bytes for this bucket
+					if (pos > 0) {
+						ByteBuffer writeBuffer = acquireBuffer();
+						buffersInUse.add(writeBuffer);
+						int bytesWritten = prepareCompressedBuffer(writeBuffer, ioBuffer, pos);
+
+						long filePos = channelPositions[bucket];
+						pendingWrites.add(channel.write(writeBuffer, filePos));
+						channelPositions[bucket] += bytesWritten;
+					}
 				}
-				CloseSuppressPath file = root.resolve(bucketFileName(bucket));
-				try (OutputStream out = new BufferedOutputStream(Files.newOutputStream(file, StandardOpenOption.CREATE,
-						StandardOpenOption.WRITE, StandardOpenOption.APPEND))) {
-					writeRecords(out, sortedOffsets, sortedHeaders, start, end);
+
+				// 3. Wait for all writes to complete
+				for (Future<Integer> future : pendingWrites) {
+					try {
+						future.get();
+					} catch (InterruptedException e) {
+						Thread.currentThread().interrupt();
+						throw new IOException("Flush interrupted", e);
+					} catch (ExecutionException e) {
+						Throwable cause = e.getCause();
+						if (cause instanceof IOException) {
+							throw (IOException) cause;
+						}
+						throw new IOException("Error during async write", cause);
+					}
 				}
+			} finally {
+				// 4. Return buffers to pool
+				bufferPool.addAll(buffersInUse);
 			}
 
 			size = 0;
 		}
 
+		private ByteBuffer acquireBuffer() {
+			ByteBuffer buffer = bufferPool.poll();
+			if (buffer == null) {
+				// Allocation is expensive, but we expect the pool to stabilize
+				buffer = ByteBuffer.allocateDirect(bufferCapacity);
+				buffer.order(ByteOrder.BIG_ENDIAN);
+			} else {
+				buffer.clear();
+			}
+			return buffer;
+		}
+
+		/**
+		 * Compresses data from rawSrc into dest buffer, adds header. Returns
+		 * total bytes ready to be written.
+		 */
+		private int prepareCompressedBuffer(ByteBuffer dest, byte[] rawSrc, int length) {
+			// Header: [Uncompressed Length (int), Compressed Length (int)]
+			int headerOffset = 0;
+			int dataOffset = CHUNK_HEADER_BYTES;
+
+			// Move position to where compressed data should start
+			dest.position(dataOffset);
+
+			// Perform compression.
+			// LZ4Compressor.compress(ByteBuffer src, ByteBuffer dest) reads
+			// from src and writes to dest.
+			// It updates dest position to the end of compressed data.
+			ByteBuffer src = ByteBuffer.wrap(rawSrc, 0, length);
+			compressor.compress(src, dest);
+
+			int compressedLength = dest.position() - dataOffset;
+
+			// Write header at absolute offsets (doesn't change position)
+			dest.putInt(headerOffset, length);
+			dest.putInt(headerOffset + Integer.BYTES, compressedLength);
+
+			// Prepare buffer for writing to channel
+			// dest.position() is currently at the end of data.
+			dest.limit(dest.position());
+			dest.position(0);
+
+			return dest.limit();
+		}
+
+		private AsynchronousFileChannel getChannel(int bucket) throws IOException {
+			AsynchronousFileChannel channel = channelCache.get(bucket);
+			if (channel == null) {
+				CloseSuppressPath file = root.resolve(bucketFileName(bucket));
+				// Open with CREATE and WRITE. We manage the append offset
+				// manually.
+				// Assuming CloseSuppressPath implements Path.
+				channel = AsynchronousFileChannel.open(file, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+				channelCache.put(bucket, channel);
+
+				// If it's a new channel in this run, we need to know where to
+				// append.
+				if (channelPositions[bucket] == -1) {
+					channelPositions[bucket] = channel.size();
+				}
+			}
+			return channel;
+		}
+
 		private void materialize(Role role, CompressTripleMapper mapper, ProgressListener listener) throws IOException {
+			// Close all write channels before reading
+			closeChannels();
+
 			ProgressListener progressListener = ProgressListener.ofNullable(listener);
 			if (tripleCount == 0) {
 				progressListener.notifyProgress(100, "Materialized " + role + " mapping");
@@ -285,6 +443,7 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 				if (!Files.exists(file)) {
 					throw new IllegalStateException("Missing bucket file: " + file);
 				}
+
 				try (InputStream in = new BufferedInputStream(Files.newInputStream(file), IO_BUFFER_BYTES)) {
 					readRecords(in, headers);
 				}
@@ -312,25 +471,6 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 				}
 			}
 			progressListener.notifyProgress(100, "Materialized " + role + " mapping");
-		}
-
-		private void writeRecords(OutputStream out, int[] offsets, long[] headers, int from, int to)
-				throws IOException {
-			byte[] buffer = ioBuffer;
-			int pos = 0;
-			for (int i = from; i < to; i++) {
-				if (buffer.length - pos < RECORD_BYTES) {
-					writeChunk(out, buffer, pos);
-					pos = 0;
-				}
-				putInt(buffer, pos, offsets[i]);
-				pos += Integer.BYTES;
-				putLong(buffer, pos, headers[i]);
-				pos += Long.BYTES;
-			}
-			if (pos > 0) {
-				writeChunk(out, buffer, pos);
-			}
 		}
 
 		private void readRecords(InputStream in, long[] headersByOffset) throws IOException {
@@ -378,14 +518,6 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 			}
 		}
 
-		private void writeChunk(OutputStream out, byte[] buffer, int length) throws IOException {
-			int compressedLength = compressor.compress(buffer, 0, length, compressedBuffer, 0, compressedBuffer.length);
-			putInt(chunkHeader, 0, length);
-			putInt(chunkHeader, Integer.BYTES, compressedLength);
-			out.write(chunkHeader, 0, CHUNK_HEADER_BYTES);
-			out.write(compressedBuffer, 0, compressedLength);
-		}
-
 		private static int readFully(InputStream in, byte[] buffer, int offset, int length) throws IOException {
 			int total = 0;
 			while (total < length) {
@@ -430,13 +562,10 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 
 		private static String bucketFileName(int bucket) {
 			if (bucket < 0 || bucket >= 1_000_000) {
-				// fallback that preserves the original semantics
 				return bucketFileNameSlowButGeneral(bucket);
 			}
-
 			char[] c = { 'b', '0', '0', '0', '0', '0', '0', '.', 'b', 'i', 'n' };
 			int x = bucket;
-
 			c[6] = (char) ('0' + (x % 10));
 			x /= 10;
 			c[5] = (char) ('0' + (x % 10));
@@ -447,15 +576,13 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 			x /= 10;
 			c[2] = (char) ('0' + (x % 10));
 			x /= 10;
-			c[1] = (char) ('0' + x); // now 0..9
-
+			c[1] = (char) ('0' + x);
 			return new String(c);
 		}
 
 		private static final String ZEROS_6 = "000000";
 
 		private static String bucketFileNameSlowButGeneral(int bucket) {
-			// same implementation as the "Fast and fully correct" version above
 			if (bucket >= 0) {
 				String digits = Integer.toString(bucket);
 				int pad = 6 - digits.length();
@@ -477,8 +604,17 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 			return sb.toString();
 		}
 
+		private void closeChannels() throws IOException {
+			for (AsynchronousFileChannel channel : channelCache.values()) {
+				channel.close();
+			}
+			channelCache.clear();
+			Arrays.fill(channelPositions, -1);
+		}
+
 		@Override
 		public void close() throws IOException {
+			closeChannels();
 			root.closeWithDeleteRecurse();
 			try {
 				root.close();
@@ -487,5 +623,4 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 			}
 		}
 	}
-
 }
