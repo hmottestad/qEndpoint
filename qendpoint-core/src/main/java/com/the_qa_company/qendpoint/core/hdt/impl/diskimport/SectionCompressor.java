@@ -6,12 +6,9 @@ import com.the_qa_company.qendpoint.core.triples.IndexedNode;
 import com.the_qa_company.qendpoint.core.triples.TripleString;
 import com.the_qa_company.qendpoint.core.util.ParallelSortableArrayList;
 import com.the_qa_company.qendpoint.core.util.io.compress.CompressNodeMergeIterator;
-import com.the_qa_company.qendpoint.core.util.io.compress.CompressNodeRange;
 import com.the_qa_company.qendpoint.core.util.io.compress.CompressNodeReader;
 import com.the_qa_company.qendpoint.core.util.io.compress.CompressUtil;
 import com.the_qa_company.qendpoint.core.iterator.utils.AsyncIteratorFetcher;
-import com.the_qa_company.qendpoint.core.iterator.utils.ExceptionIterator;
-import com.the_qa_company.qendpoint.core.iterator.utils.RangeAwareMergeExceptionIterator;
 import com.the_qa_company.qendpoint.core.iterator.utils.SizeFetcher;
 import com.the_qa_company.qendpoint.core.iterator.utils.SizedSupplier;
 import com.the_qa_company.qendpoint.core.util.concurrent.ExceptionFunction;
@@ -420,10 +417,7 @@ public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString
 				il.notifyProgress(0, "sorting");
 				try (OutputStream stream = sections.openWSubject()) {
 					subjects.parallelSort(IndexedNode::compareTo);
-					RangeAwareMergeExceptionIterator.KeyRange<IndexedNode> nodeRange = CompressUtil
-							.writeCompressedSectionWithRange(ExceptionIterator.of(subjects.iterator()), subjects.size(),
-									stream, il);
-					CompressNodeRange.writeRange(sections.getSubjectPath(), nodeRange);
+					CompressUtil.writeCompressedSection(subjects, stream, il);
 				}
 				il.setRange(range, range + split);
 				range += split;
@@ -431,10 +425,7 @@ public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString
 				il.notifyProgress(0, "sorting");
 				try (OutputStream stream = sections.openWPredicate()) {
 					predicates.parallelSort(IndexedNode::compareTo);
-					RangeAwareMergeExceptionIterator.KeyRange<IndexedNode> nodeRange = CompressUtil
-							.writeCompressedSectionWithRange(ExceptionIterator.of(predicates.iterator()),
-									predicates.size(), stream, il);
-					CompressNodeRange.writeRange(sections.getPredicatePath(), nodeRange);
+					CompressUtil.writeCompressedSection(predicates, stream, il);
 				}
 				il.setRange(range, range + split);
 				range += split;
@@ -442,10 +433,7 @@ public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString
 				il.notifyProgress(0, "sorting");
 				try (OutputStream stream = sections.openWObject()) {
 					objects.parallelSort(IndexedNode::compareTo);
-					RangeAwareMergeExceptionIterator.KeyRange<IndexedNode> nodeRange = CompressUtil
-							.writeCompressedSectionWithRange(ExceptionIterator.of(objects.iterator()), objects.size(),
-									stream, il);
-					CompressNodeRange.writeRange(sections.getObjectPath(), nodeRange);
+					CompressUtil.writeCompressedSection(objects, stream, il);
 				}
 				if (graph != null) {
 					il.setRange(range, range + split);
@@ -453,10 +441,7 @@ public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString
 					il.notifyProgress(0, "sorting");
 					try (OutputStream stream = sections.openWGraph()) {
 						graph.parallelSort(IndexedNode::compareTo);
-						RangeAwareMergeExceptionIterator.KeyRange<IndexedNode> nodeRange = CompressUtil
-								.writeCompressedSectionWithRange(ExceptionIterator.of(graph.iterator()), graph.size(),
-										stream, il);
-						CompressNodeRange.writeRange(sections.getGraphPath(), nodeRange);
+						CompressUtil.writeCompressedSection(graph, stream, il);
 					}
 				}
 			} finally {
@@ -678,29 +663,28 @@ public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString
 
 		private void computeSubject(List<TripleFile> triples, boolean async) throws IOException {
 			computeSection(triples, "subject", 0, 33, this::openWSubject, TripleFile::openRSubject,
-					TripleFile::getSubjectPath, getSubjectPath(), async);
+					TripleFile::getSubjectPath, async);
 		}
 
 		private void computePredicate(List<TripleFile> triples, boolean async) throws IOException {
 			computeSection(triples, "predicate", 33, 66, this::openWPredicate, TripleFile::openRPredicate,
-					TripleFile::getPredicatePath, getPredicatePath(), async);
+					TripleFile::getPredicatePath, async);
 		}
 
 		private void computeObject(List<TripleFile> triples, boolean async) throws IOException {
 			computeSection(triples, "object", 66, 100, this::openWObject, TripleFile::openRObject,
-					TripleFile::getObjectPath, getObjectPath(), async);
+					TripleFile::getObjectPath, async);
 		}
 
 		private void computeGraph(List<TripleFile> triples, boolean async) throws IOException {
 			computeSection(triples, "graph", 66, 100, this::openWGraph, TripleFile::openRGraph,
-					TripleFile::getGraphPath, getGraphPath(), async);
+					TripleFile::getGraphPath, async);
 		}
 
 		private void computeSection(List<TripleFile> triples, String section, int start, int end,
 				ExceptionSupplier<OutputStream, IOException> openW,
 				ExceptionFunction<TripleFile, InputStream, IOException> openR,
-				Function<TripleFile, CloseSuppressPath> filePath, CloseSuppressPath outputPath, boolean async)
-				throws IOException {
+				Function<TripleFile, Closeable> fileDelete, boolean async) throws IOException {
 			IntermediateListener il = new IntermediateListener(listener);
 			if (async) {
 				listener.registerThread(Thread.currentThread().getName());
@@ -712,24 +696,20 @@ public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString
 
 			// readers to create the merge tree
 			CompressNodeReader[] readers = new CompressNodeReader[triples.size()];
-			CloseSuppressPath[] inputPaths = new CloseSuppressPath[triples.size()];
+			Closeable[] fileDeletes = new Closeable[triples.size()];
 			try {
 				long size = 0L;
 				for (int i = 0; i < triples.size(); i++) {
-					CloseSuppressPath path = filePath.apply(triples.get(i));
-					CompressNodeReader reader = new CompressNodeReader(openR.apply(triples.get(i)),
-							CompressNodeRange.readRangeIfExists(path));
+					CompressNodeReader reader = new CompressNodeReader(openR.apply(triples.get(i)));
 					size += reader.getSize();
 					readers[i] = reader;
-					inputPaths[i] = path;
+					fileDeletes[i] = fileDelete.apply(triples.get(i));
 				}
 
 				// section
 				try (OutputStream output = openW.get()) { // IndexNodeDeltaMergeExceptionIterator
-					RangeAwareMergeExceptionIterator.KeyRange<IndexedNode> range = CompressUtil
-							.writeCompressedSectionWithRange(CompressNodeMergeIterator.buildOfTree(readers), size,
-									output, il);
-					CompressNodeRange.writeRange(outputPath, range);
+					CompressUtil.writeCompressedSection(CompressNodeMergeIterator.buildOfTree(readers), size, output,
+							il);
 				}
 			} finally {
 				if (async) {
@@ -738,12 +718,7 @@ public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString
 				try {
 					IOUtil.closeAll(readers);
 				} finally {
-					IOUtil.closeAll(inputPaths);
-					for (CloseSuppressPath path : inputPaths) {
-						if (path != null) {
-							CompressNodeRange.deleteRangeIfExists(path);
-						}
-					}
+					IOUtil.closeAll(fileDeletes);
 				}
 			}
 		}

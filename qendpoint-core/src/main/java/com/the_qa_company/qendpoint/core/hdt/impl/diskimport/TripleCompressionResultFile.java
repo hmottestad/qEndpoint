@@ -3,7 +3,6 @@ package com.the_qa_company.qendpoint.core.hdt.impl.diskimport;
 import com.the_qa_company.qendpoint.core.enums.TripleComponentOrder;
 import com.the_qa_company.qendpoint.core.triples.TempTriples;
 import com.the_qa_company.qendpoint.core.util.io.compress.CompressTripleReader;
-import com.the_qa_company.qendpoint.core.util.io.compress.CompressTripleRange;
 import com.the_qa_company.qendpoint.core.triples.impl.OneReadTempTriples;
 import com.the_qa_company.qendpoint.core.util.io.CloseSuppressPath;
 import com.the_qa_company.qendpoint.core.util.io.IOUtil;
@@ -26,7 +25,7 @@ public class TripleCompressionResultFile implements TripleCompressionResult {
 			int bufferSize, long graphs) throws IOException {
 		this.tripleCount = tripleCount;
 		this.graphs = graphs;
-		this.reader = new CompressTripleReader(triples, bufferSize);
+		this.reader = new CompressTripleReader(triples.openInputStream(bufferSize));
 		this.order = order;
 		this.triples = triples;
 	}
@@ -43,10 +42,6 @@ public class TripleCompressionResultFile implements TripleCompressionResult {
 
 	@Override
 	public void close() throws IOException {
-		try {
-			IOUtil.closeAll(reader, triples);
-		} finally {
-			CompressTripleRange.deleteRangeIfExists(triples);
-		}
+		IOUtil.closeAll(reader, triples);
 	}
 }

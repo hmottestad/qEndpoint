@@ -2,7 +2,6 @@ package com.the_qa_company.qendpoint.core.hdt.impl.diskimport;
 
 import com.the_qa_company.qendpoint.core.triples.IndexedNode;
 import com.the_qa_company.qendpoint.core.util.io.compress.CompressNodeMergeIterator;
-import com.the_qa_company.qendpoint.core.util.io.compress.CompressNodeRange;
 import com.the_qa_company.qendpoint.core.util.io.compress.CompressNodeReader;
 import com.the_qa_company.qendpoint.core.iterator.utils.ExceptionIterator;
 import com.the_qa_company.qendpoint.core.util.io.IOUtil;
@@ -140,15 +139,11 @@ public class CompressionResultPartial implements CompressionResult {
 		final SectionCompressor.TripleFile file;
 
 		public CompressNodeReaderTriple(SectionCompressor.TripleFile file, boolean graph) throws IOException {
-			this.s = new CompressNodeReader(file.openRSubject(),
-					CompressNodeRange.readRangeIfExists(file.getSubjectPath()));
-			this.p = new CompressNodeReader(file.openRPredicate(),
-					CompressNodeRange.readRangeIfExists(file.getPredicatePath()));
-			this.o = new CompressNodeReader(file.openRObject(),
-					CompressNodeRange.readRangeIfExists(file.getObjectPath()));
+			this.s = new CompressNodeReader(file.openRSubject());
+			this.p = new CompressNodeReader(file.openRPredicate());
+			this.o = new CompressNodeReader(file.openRObject());
 			if (graph) {
-				this.g = new CompressNodeReader(file.openRGraph(),
-						CompressNodeRange.readRangeIfExists(file.getGraphPath()));
+				this.g = new CompressNodeReader(file.openRGraph());
 			} else {
 				this.g = null;
 			}

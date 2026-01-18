@@ -41,7 +41,7 @@ public class TripleCompressionResultPartial implements TripleCompressionResult {
 			return ExceptionIterator.empty();
 		}
 		if (size == 1) {
-			CompressTripleReader r = new CompressTripleReader(files.get(start), bufferSize);
+			CompressTripleReader r = new CompressTripleReader(files.get(start).openInputStream(bufferSize));
 			this.files.add(r);
 			return r;
 		}

@@ -1,13 +1,11 @@
 package com.the_qa_company.qendpoint.core.util.io.compress;
 
-import com.the_qa_company.qendpoint.core.compact.integer.VByte;
 import com.the_qa_company.qendpoint.core.exceptions.CRCException;
+import com.the_qa_company.qendpoint.core.compact.integer.VByte;
 import com.the_qa_company.qendpoint.core.iterator.utils.ExceptionIterator;
-import com.the_qa_company.qendpoint.core.iterator.utils.RangeAwareMergeExceptionIterator;
 import com.the_qa_company.qendpoint.core.util.crc.CRC32;
 import com.the_qa_company.qendpoint.core.util.crc.CRCInputStream;
 import com.the_qa_company.qendpoint.core.util.io.CRCStopBitInputStream;
-import com.the_qa_company.qendpoint.core.util.io.CloseSuppressPath;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -18,27 +16,16 @@ import java.io.InputStream;
  *
  * @author Antoine Willerval
  */
-public class PairReader implements ExceptionIterator<Pair, IOException>, Closeable,
-		RangeAwareMergeExceptionIterator.RangedExceptionIterator<Pair, IOException> {
+public class PairReader implements ExceptionIterator<Pair, IOException>, Closeable {
 	private final CRCInputStream stream;
 	private final Pair next = new Pair();
 	private boolean read = false, end = false;
 	private final long size;
 	private long index;
-	private final RangeAwareMergeExceptionIterator.KeyRange<Pair> range;
 
 	public PairReader(InputStream stream) throws IOException {
-		this(stream, null);
-	}
-
-	public PairReader(CloseSuppressPath path, int bufferSize) throws IOException {
-		this(path.openInputStream(bufferSize), PairRange.readRangeIfExists(path));
-	}
-
-	private PairReader(InputStream stream, RangeAwareMergeExceptionIterator.KeyRange<Pair> range) throws IOException {
 		this.stream = new CRCStopBitInputStream(stream, new CRC32());
 		size = VByte.decode(this.stream);
-		this.range = range;
 	}
 
 	public long getSize() {
@@ -92,11 +79,6 @@ public class PairReader implements ExceptionIterator<Pair, IOException>, Closeab
 		}
 		read = false;
 		return next;
-	}
-
-	@Override
-	public RangeAwareMergeExceptionIterator.KeyRange<Pair> keyRange() {
-		return range;
 	}
 
 	@Override

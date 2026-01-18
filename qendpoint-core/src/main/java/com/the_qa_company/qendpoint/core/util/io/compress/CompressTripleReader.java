@@ -1,13 +1,11 @@
 package com.the_qa_company.qendpoint.core.util.io.compress;
 
-import com.the_qa_company.qendpoint.core.compact.integer.VByte;
 import com.the_qa_company.qendpoint.core.exceptions.CRCException;
-import com.the_qa_company.qendpoint.core.iterator.utils.ExceptionIterator;
-import com.the_qa_company.qendpoint.core.iterator.utils.RangeAwareMergeExceptionIterator;
 import com.the_qa_company.qendpoint.core.triples.TripleID;
+import com.the_qa_company.qendpoint.core.compact.integer.VByte;
+import com.the_qa_company.qendpoint.core.iterator.utils.ExceptionIterator;
 import com.the_qa_company.qendpoint.core.util.crc.CRC32;
 import com.the_qa_company.qendpoint.core.util.crc.CRCInputStream;
-import com.the_qa_company.qendpoint.core.util.io.CloseSuppressPath;
 import com.the_qa_company.qendpoint.core.util.io.CRCStopBitInputStream;
 
 import java.io.Closeable;
@@ -19,28 +17,16 @@ import java.io.InputStream;
  *
  * @author Antoine Willerval
  */
-public class CompressTripleReader implements ExceptionIterator<TripleID, IOException>, Closeable,
-		RangeAwareMergeExceptionIterator.RangedExceptionIterator<TripleID, IOException> {
+public class CompressTripleReader implements ExceptionIterator<TripleID, IOException>, Closeable {
 	private final CRCInputStream stream;
 	private final TripleID next = new TripleID(-1, -1, -1);
 	private boolean read = false, end = false;
 	private final boolean quad;
-	private final RangeAwareMergeExceptionIterator.KeyRange<TripleID> range;
 
 	public CompressTripleReader(InputStream stream) throws IOException {
-		this(stream, null);
-	}
-
-	public CompressTripleReader(CloseSuppressPath path, int bufferSize) throws IOException {
-		this(path.openInputStream(bufferSize), CompressTripleRange.readRangeIfExists(path));
-	}
-
-	private CompressTripleReader(InputStream stream, RangeAwareMergeExceptionIterator.KeyRange<TripleID> range)
-			throws IOException {
 		this.stream = new CRCStopBitInputStream(stream, new CRC32());
 		int flags = this.stream.read();
 		this.quad = (flags & CompressTripleWriter.FLAG_QUAD) != 0;
-		this.range = range;
 	}
 
 	@Override
@@ -118,11 +104,6 @@ public class CompressTripleReader implements ExceptionIterator<TripleID, IOExcep
 		}
 		read = false;
 		return next;
-	}
-
-	@Override
-	public RangeAwareMergeExceptionIterator.KeyRange<TripleID> keyRange() {
-		return range;
 	}
 
 	@Override

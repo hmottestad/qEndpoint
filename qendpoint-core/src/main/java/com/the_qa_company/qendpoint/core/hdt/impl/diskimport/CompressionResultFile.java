@@ -1,7 +1,6 @@
 package com.the_qa_company.qendpoint.core.hdt.impl.diskimport;
 
 import com.the_qa_company.qendpoint.core.triples.IndexedNode;
-import com.the_qa_company.qendpoint.core.util.io.compress.CompressNodeRange;
 import com.the_qa_company.qendpoint.core.util.io.compress.CompressNodeReader;
 import com.the_qa_company.qendpoint.core.iterator.utils.ExceptionIterator;
 import com.the_qa_company.qendpoint.core.util.io.IOUtil;
@@ -27,16 +26,12 @@ public class CompressionResultFile implements CompressionResult {
 			boolean supportsGraph) throws IOException {
 		this.tripleCount = tripleCount;
 		this.ntRawSize = ntRawSize;
-		this.subjects = new CompressNodeReader(sections.openRSubject(),
-				CompressNodeRange.readRangeIfExists(sections.getSubjectPath()));
-		this.predicates = new CompressNodeReader(sections.openRPredicate(),
-				CompressNodeRange.readRangeIfExists(sections.getPredicatePath()));
-		this.objects = new CompressNodeReader(sections.openRObject(),
-				CompressNodeRange.readRangeIfExists(sections.getObjectPath()));
+		this.subjects = new CompressNodeReader(sections.openRSubject());
+		this.predicates = new CompressNodeReader(sections.openRPredicate());
+		this.objects = new CompressNodeReader(sections.openRObject());
 		this.supportsGraph = supportsGraph;
 		if (supportsGraph) {
-			this.graph = new CompressNodeReader(sections.openRGraph(),
-					CompressNodeRange.readRangeIfExists(sections.getGraphPath()));
+			this.graph = new CompressNodeReader(sections.openRGraph());
 		} else {
 			this.graph = null;
 		}
