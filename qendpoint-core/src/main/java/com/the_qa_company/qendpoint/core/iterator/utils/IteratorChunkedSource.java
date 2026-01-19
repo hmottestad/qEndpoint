@@ -69,7 +69,7 @@ public final class IteratorChunkedSource<E> implements ExceptionSupplier<SizedSu
 				}
 			}
 
-			bufferSize = Math.min(32*1024*1023, Math.max(bufferSize, buffer.size()));
+			bufferSize = Math.min(32 * 1024 * 1023, Math.max(bufferSize, buffer.size()));
 
 			if (buffer.isEmpty()) {
 				end = true;
