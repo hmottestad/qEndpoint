@@ -38,8 +38,16 @@ import java.net.URI;
  */
 public class RDFParserSimple implements RDFParserCallback {
 	private static final Logger log = LoggerFactory.getLogger(RDFParserSimple.class);
-	private static final String JENA_COMPAT_BASE_URI = "http://www.rdfhdt.org";
 	private final RDFParserRIOT riotParser = new RDFParserRIOT();
+	private final boolean strict;
+
+	public RDFParserSimple() {
+		this(false);
+	}
+
+	public RDFParserSimple(boolean strict) {
+		this.strict = strict;
+	}
 
 	/*
 	 * (non-Javadoc)
@@ -61,7 +69,7 @@ public class RDFParserSimple implements RDFParserCallback {
 	public void doParse(InputStream input, String baseUri, RDFNotation notation, boolean keepBNode,
 			RDFCallback callback) throws ParserException {
 		if (notation == RDFNotation.NTRIPLES || notation == RDFNotation.NQUAD) {
-			boolean allowRelativeIri = isJenaCompatBaseUri(baseUri);
+			boolean allowRelativeIri = !strict;
 			String parserBaseUri = allowRelativeIri ? null : baseUri;
 			try (InputStream in = input) {
 				RDFCallback strictCallback = (triple, pos) -> {
@@ -86,7 +94,7 @@ public class RDFParserSimple implements RDFParserCallback {
 					}
 					callback.processTriple(triple, pos);
 				};
-				riotParser.doParse(in, parserBaseUri, notation, true, strictCallback);
+				riotParser.doParse(in, parserBaseUri, notation, true, strictCallback, false, strict);
 			} catch (IOException e) {
 				throw new ParserException(e);
 			}
@@ -167,10 +175,6 @@ public class RDFParserSimple implements RDFParserCallback {
 		} catch (IllegalArgumentException e) {
 			return value;
 		}
-	}
-
-	private static boolean isJenaCompatBaseUri(String baseUri) {
-		return JENA_COMPAT_BASE_URI.equals(baseUri);
 	}
 
 	private static CharSequence resolveRelativeDatatypeIri(CharSequence literal, String baseUri) {

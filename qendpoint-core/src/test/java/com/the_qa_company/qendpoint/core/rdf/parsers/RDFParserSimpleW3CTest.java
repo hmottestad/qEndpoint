@@ -44,7 +44,7 @@ public class RDFParserSimpleW3CTest {
 
 	@Test
 	public void runW3CTest() throws Exception {
-		RDFParserSimple parser = new RDFParserSimple();
+		RDFParserSimple parser = new RDFParserSimple(true);
 		try (InputStream input = testCase.action.openStream()) {
 			parser.doParse(input, null, testCase.notation, true, (triple, pos) -> {});
 			if (!testCase.expectSuccess) {
