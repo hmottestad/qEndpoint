@@ -88,17 +88,20 @@ export JAVA_OPTIONS="-Xms16G -Xmx16G -XX:+UseParallelGC -XX:+AlwaysPreTouch -XX:
 #Different objects ..... 115723374
 #Common Subject/Object . 5709760
 #Index generated and saved in 1 min 41 sec 838 ms 901 us
-export JAVA_OPTIONS="-Xms32G -Xmx32G -XX:+UseParallelGC -XX:+AlwaysPreTouch -XX:+DisableExplicitGC"
+#export JAVA_OPTIONS="-Xms32G -Xmx32G -XX:+UseParallelGC -XX:+AlwaysPreTouch -XX:+DisableExplicitGC"
 #export JAVA_OPTIONS="-Xms32G -Xmx32G -XX:+UseParallelGC -XX:+AlwaysPreTouch -XX:+DisableExplicitGC -XX:+UseCompactObjectHeaders"
-time ./qendpoint-cli-2.5.3/bin/rdf2hdt.sh -index -disk -disklocation ./temp/ -multithread /Users/havardottestad/Documents/wikidata/first_500M_lines_truthy.nt.gz first_500M_lines_truthy.hdt
+#time ./qendpoint-cli-2.5.3/bin/rdf2hdt.sh -index -disk -disklocation ./temp/ -multithread /Users/havardottestad/Documents/wikidata/first_500M_lines_truthy.nt.gz first_500M_lines_truthy.hdt
 
 
-
-#File converted in ..... 5 hour 27 min 57 sec 195 ms 782 us
-#Total Triples ......... 20 754 779 933
-#Different subjects .... 2 276 125 108
-#Different predicates .. 60 661
-#Different objects ..... 3 753 832 879
-#Common Subject/Object . 2 056 458 644
-#export JAVA_OPTIONS="-Xms64G -Xmx64G -XX:+UseParallelGC -XX:+AlwaysPreTouch -XX:+DisableExplicitGC -XX:+UseCompactObjectHeaders"
-#time ./qendpoint-cli-2.5.3/bin/rdf2hdt.sh -disk -disklocation ./temp/ -multithread /Users/havardottestad/Documents/wikidata/wikidata-20251208-all-BETA.nt.gz wikidata-20251208-all-BETA.hdt
+#[main] . [##########] 100.0 done
+#Total Triples ......... 20754779933
+#Different subjects .... 2276125108
+#Different predicates .. 60661
+#Different objects ..... 3753832879
+#Common Subject/Object . 2056458644
+#
+#real    381m5.685s
+#user    1288m23.132s
+#sys     285m19.233s
+export JAVA_OPTIONS="-Xms64G -Xmx64G -XX:+UseParallelGC -XX:+AlwaysPreTouch -XX:+DisableExplicitGC -XX:+UseCompactObjectHeaders"
+time ./qendpoint-cli-2.5.3/bin/rdf2hdt.sh -disk -disklocation ./temp/ -multithread /Users/havardottestad/Documents/wikidata/wikidata-20251208-all-BETA.nt.gz wikidata-20251208-all-BETA.hdt
