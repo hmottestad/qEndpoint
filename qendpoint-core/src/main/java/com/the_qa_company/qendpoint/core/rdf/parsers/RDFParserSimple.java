@@ -94,7 +94,7 @@ public class RDFParserSimple implements RDFParserCallback {
 					}
 					callback.processTriple(triple, pos);
 				};
-				riotParser.doParse(in, parserBaseUri, notation, true, strictCallback, false, strict);
+				riotParser.doParse(in, parserBaseUri, notation, keepBNode, strictCallback, false, strict);
 			} catch (IOException e) {
 				throw new ParserException(e);
 			}
