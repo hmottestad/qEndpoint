@@ -29,7 +29,6 @@ import java.util.List;
 public class RDFParserSimpleW3CTest {
 	private static final String NTRIPLES_MANIFEST = "w3c/N-Triples/manifest.ttl";
 	private static final String NQUADS_MANIFEST = "w3c/N-Quads/manifest.ttl";
-	private static final String BASE_URI = "http://example.com/";
 
 	@Parameterized.Parameters(name = "{0}")
 	public static Collection<TestCase> params() throws Exception {
@@ -47,7 +46,7 @@ public class RDFParserSimpleW3CTest {
 	public void runW3CTest() throws Exception {
 		RDFParserSimple parser = new RDFParserSimple();
 		try (InputStream input = testCase.action.openStream()) {
-			parser.doParse(input, BASE_URI, testCase.notation, true, (triple, pos) -> {});
+			parser.doParse(input, null, testCase.notation, true, (triple, pos) -> {});
 			if (!testCase.expectSuccess) {
 				Assert.fail("Expected parse failure for " + testCase.name + " (" + testCase.action + ")");
 			}
