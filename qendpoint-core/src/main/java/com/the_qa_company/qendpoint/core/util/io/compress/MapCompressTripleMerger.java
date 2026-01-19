@@ -251,6 +251,8 @@ public class MapCompressTripleMerger implements KWayMerger.KWayMergerImpl<Triple
 		};
 	}
 
+	long localCount = 0;
+
 	@Override
 	public void createChunk(SizedSupplier<TripleID> flux, CloseSuppressPath output)
 			throws KWayMerger.KWayMergerException {
@@ -275,10 +277,12 @@ public class MapCompressTripleMerger implements KWayMerger.KWayMergerImpl<Triple
 			assert mappedTriple.isValid();
 			tripleIDS.add(mappedTriple);
 			triplesCount.increment();
-			long count = triplesCount.sum();
-			if (count % 10_000 == 0) {
+			long l = localCount++;
+			if (l % 10_000 == 0) {
+				long count = triplesCount.sum();
 				listener.notifyProgress(10, "reading triples part2 " + count);
 			}
+
 			if (tripleIDS.size() == Integer.MAX_VALUE - 6) {
 				break;
 			}
@@ -322,6 +326,10 @@ public class MapCompressTripleMerger implements KWayMerger.KWayMergerImpl<Triple
 	public void mergeChunks(List<CloseSuppressPath> inputs, CloseSuppressPath output)
 			throws KWayMerger.KWayMergerException {
 		try {
+			if (Thread.currentThread().isInterrupted()) {
+				throw new RuntimeException("Thread interrupted before merging triples");
+			}
+
 			listener.notifyProgress(0, "merging triples " + output.getFileName());
 			CompressTripleReader[] readers = new CompressTripleReader[inputs.size()];
 			try {
@@ -339,7 +347,7 @@ public class MapCompressTripleMerger implements KWayMerger.KWayMergerImpl<Triple
 					long written = 0;
 					while (it.hasNext()) {
 						w.appendTriple(it.next());
-						if (count % 16 * 1024 == 0) {
+						if (count % 1_000_000 == 0) {
 							listener.notifyProgress(count / (block / 10f), "merging triples " + count + "/" + size);
 						}
 						count++;

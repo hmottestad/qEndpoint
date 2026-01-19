@@ -155,25 +155,26 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 		// --- Async I/O tuning knobs ---
 		// Bounds simultaneously-open bucket files per flush batch (avoid FD
 		// explosion).
-		private static final int MAX_IN_FLIGHT_BUCKETS = 64;
-		// LRU of idle channels kept open across flushes.
-		private static final int MAX_CACHED_CHANNELS = 128;
+		private static final int MAX_IN_FLIGHT_BUCKETS = 256;
 
-		// ByteBuffer pool knobs (heap buffers with backing arrays)
-		private static final int WRITE_BUF_ROUNDING = 4 * 1024; // round
-																// capacities to
-																// 4KiB
-		private static final int WRITE_BUF_POOL_MAX_BYTES = 64 * 1024 * 1024; // total
-																				// pooled
-																				// memory
-																				// cap
-		private static final int WRITE_BUF_POOL_MAX_PER_SIZE = 8; // per-size
-																	// cap
-		private static final int WRITE_BUF_POOL_MAX_BUFFER_BYTES = 2 * 1024 * 1024; // don't
-																					// pool
-																					// buffers
-																					// >
-																					// 2MiB
+		// LRU of idle channels kept open across flushes.
+		private static final int MAX_CACHED_CHANNELS = 512;
+
+		/*
+		 * ByteBuffer pool knobs (heap buffers with backing arrays)
+		 */
+
+		// round capacities to 4KiB
+		private static final int WRITE_BUF_ROUNDING = 4 * 1024;
+
+		// total pooled memory cap
+		private static final int WRITE_BUF_POOL_MAX_BYTES = 256 * 1024 * 1024;
+
+		// per-size cap
+		private static final int WRITE_BUF_POOL_MAX_PER_SIZE = 8;
+
+		// don't pool buffers > 2MiB
+		private static final int WRITE_BUF_POOL_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
 
 		private final CloseSuppressPath root;
 		private final long tripleCount;
@@ -446,8 +447,9 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 		}
 
 		private static void closeQuietly(AsynchronousFileChannel ch) {
-			if (ch == null)
+			if (ch == null) {
 				return;
+			}
 			try {
 				ch.close();
 			} catch (IOException ignored) {
@@ -563,20 +565,23 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 							ch.channel.close();
 						}
 					} catch (IOException e) {
-						if (first == null)
+						if (first == null) {
 							first = e;
-						else
+						} else {
 							first.addSuppressed(e);
+						}
 					}
 				}
 				lru.clear();
-				if (first != null)
+				if (first != null) {
 					throw first;
+				}
 			}
 
 			private static void closeQuietly(CachedChannel ch) {
-				if (ch == null || ch.channel == null)
+				if (ch == null || ch.channel == null) {
 					return;
+				}
 				try {
 					ch.channel.close();
 				} catch (IOException ignored) {
@@ -629,14 +634,17 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 			}
 
 			void release(ByteBuffer buf) {
-				if (buf == null)
+				if (buf == null) {
 					return;
+				}
 
 				int cap = buf.capacity();
-				if (cap <= 0)
+				if (cap <= 0) {
 					return;
-				if (cap > maxBufferBytes)
+				}
+				if (cap > maxBufferBytes) {
 					return; // don't pool huge buffers
+				}
 
 				buf.clear();
 
@@ -838,8 +846,9 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 				int pad = 6 - digits.length();
 				StringBuilder sb = new StringBuilder(1 + Math.max(6, digits.length()) + 4);
 				sb.append('b');
-				if (pad > 0)
+				if (pad > 0) {
 					sb.append(ZEROS_6, 0, pad);
+				}
 				sb.append(digits).append(".bin");
 				return sb.toString();
 			}
@@ -848,8 +857,9 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 			int pad = 5 - digits.length();
 			StringBuilder sb = new StringBuilder(1 + 1 + Math.max(5, digits.length()) + 4);
 			sb.append('b').append('-');
-			if (pad > 0)
+			if (pad > 0) {
 				sb.append(ZEROS_6, 0, pad);
+			}
 			sb.append(digits).append(".bin");
 			return sb.toString();
 		}

@@ -685,6 +685,11 @@ public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString
 				ExceptionSupplier<OutputStream, IOException> openW,
 				ExceptionFunction<TripleFile, InputStream, IOException> openR,
 				Function<TripleFile, Closeable> fileDelete, boolean async) throws IOException {
+
+			if (Thread.currentThread().isInterrupted()) {
+				throw new RuntimeException("Thread interrupted before merging section");
+			}
+
 			IntermediateListener il = new IntermediateListener(listener);
 			if (async) {
 				listener.registerThread(Thread.currentThread().getName());

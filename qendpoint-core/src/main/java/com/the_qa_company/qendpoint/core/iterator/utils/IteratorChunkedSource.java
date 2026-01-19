@@ -1,8 +1,10 @@
 package com.the_qa_company.qendpoint.core.iterator.utils;
 
 import com.the_qa_company.qendpoint.core.util.concurrent.ExceptionSupplier;
+import org.apache.commons.io.FileUtils;
 
 import java.io.Closeable;
+import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Iterator;
@@ -41,6 +43,8 @@ public final class IteratorChunkedSource<E> implements ExceptionSupplier<SizedSu
 		this.copier = copier;
 	}
 
+	static int bufferSize = 4;
+
 	@Override
 	public SizedSupplier<E> get() {
 		lock.lock();
@@ -49,7 +53,7 @@ public final class IteratorChunkedSource<E> implements ExceptionSupplier<SizedSu
 				return null;
 			}
 
-			ArrayList<E> buffer = new ArrayList<>();
+			ArrayList<E> buffer = new ArrayList<>(bufferSize);
 			long size = 0;
 
 			while (iterator.hasNext()) {
@@ -64,6 +68,8 @@ public final class IteratorChunkedSource<E> implements ExceptionSupplier<SizedSu
 					break;
 				}
 			}
+
+			bufferSize = Math.min(32*1024*1023, Math.max(bufferSize, buffer.size()));
 
 			if (buffer.isEmpty()) {
 				end = true;

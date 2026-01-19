@@ -14,6 +14,7 @@ import java.nio.charset.StandardCharsets;
 public class ChunkedConcurrentInputStream {
 
 	private static final Logger log = LoggerFactory.getLogger(ChunkedConcurrentInputStream.class);
+	static final int PIPE_SIZE_BYTES = 131072 * 16;
 	private final InputStream source;
 	private final int numberOfStreams;
 
@@ -36,11 +37,9 @@ public class ChunkedConcurrentInputStream {
 		pipedInputStreams = new PipedInputStream[numberOfStreams];
 		pipedOutputStreams = new PipedOutputStream[numberOfStreams];
 
-		// The size of the pipes needs to be larger than the buffer of the
-		// buffered reader that Jena uses inside the parser, which is 131072
-		// bytes. If our pipeSize is too small it limits the ability for the
-		// parsers to work concurrently.
-		int pipeSize = 131072 * 1024 * 2;
+		// Must exceed the Jena buffered reader size (131072 bytes) without
+		// allocating multi-megabyte buffers per stream.
+		int pipeSize = PIPE_SIZE_BYTES;
 
 		try {
 			// Set up main fan-out pipes
