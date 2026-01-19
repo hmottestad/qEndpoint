@@ -69,20 +69,20 @@ public class RDFParserSimple implements RDFParserCallback {
 	public void doParse(InputStream input, String baseUri, RDFNotation notation, boolean keepBNode,
 			RDFCallback callback) throws ParserException {
 		if (notation == RDFNotation.NTRIPLES || notation == RDFNotation.NQUAD) {
-			boolean allowRelativeIri = !strict;
-			String parserBaseUri = allowRelativeIri ? null : baseUri;
+			String parserBaseUri = baseUri;
+			boolean hasBaseUri = baseUri != null && !baseUri.isEmpty();
 			try (InputStream in = input) {
 				RDFCallback strictCallback = (triple, pos) -> {
-					if (!allowRelativeIri) {
-						if (baseUri != null && !baseUri.isEmpty()) {
-							triple.setSubject(resolveRelativeIri(triple.getSubject(), baseUri));
-							triple.setPredicate(resolveRelativeIri(triple.getPredicate(), baseUri));
-							triple.setObject(resolveRelativeIri(triple.getObject(), baseUri));
-							triple.setObject(resolveRelativeDatatypeIri(triple.getObject(), baseUri));
-							if (triple instanceof QuadString quad) {
-								quad.setGraph(resolveRelativeIri(quad.getGraph(), baseUri));
-							}
+					if (!strict && hasBaseUri) {
+						triple.setSubject(resolveRelativeIri(triple.getSubject(), baseUri));
+						triple.setPredicate(resolveRelativeIri(triple.getPredicate(), baseUri));
+						triple.setObject(resolveRelativeIri(triple.getObject(), baseUri));
+						triple.setObject(resolveRelativeDatatypeIri(triple.getObject(), baseUri));
+						if (triple instanceof QuadString quad) {
+							quad.setGraph(resolveRelativeIri(quad.getGraph(), baseUri));
 						}
+					}
+					if (strict) {
 						requireAbsoluteIri(triple.getSubject(), "subject");
 						requireAbsoluteIri(triple.getPredicate(), "predicate");
 						requireAbsoluteIri(triple.getObject(), "object");
@@ -170,8 +170,17 @@ public class RDFParserSimple implements RDFParserCallback {
 		if (!isIriToken(value) || isAbsoluteIri(value)) {
 			return value;
 		}
+		String raw = value.toString();
+		String iri = raw;
+		int length = raw.length();
+		if (length > 1 && raw.charAt(0) == '<' && raw.charAt(length - 1) == '>') {
+			iri = raw.substring(1, length - 1);
+		}
+		if (isAbsoluteIri(iri)) {
+			return value;
+		}
 		try {
-			return URI.create(baseUri).resolve(value.toString()).toString();
+			return URI.create(baseUri).resolve(iri).toString();
 		} catch (IllegalArgumentException e) {
 			return value;
 		}
