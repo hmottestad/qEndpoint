@@ -409,9 +409,8 @@ public class PipedCopyIterator<T> implements Iterator<T>, Closeable {
 			writeArraySize = 0;
 		}
 		if (e != null) {
-			// clear the queue to force the exception
-			activeReadQueue.clear();
-			activeWriteQueue.clear();
+			// Don't drain here: DisruptorQueue consumerSequence must only be
+			// advanced by the consumer thread.
 			if (e instanceof PipedIteratorException) {
 				this.exception = (PipedIteratorException) e;
 			} else {
