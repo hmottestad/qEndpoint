@@ -20,6 +20,9 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Objects;
 
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+
 @RunWith(Parameterized.class)
 public class TempHDTImporterTest {
 	@Parameterized.Parameters(name = "{0}")
@@ -71,5 +74,20 @@ public class TempHDTImporterTest {
 	@Test
 	public void bNodeZStreamTest() throws ParserException, IOException {
 		HDTManager.generateHDT(asIt(getFile("importer/bnode_z.nt")), HDTTestUtils.BASE_URI, spec, null).close();
+	}
+
+	@Test
+	public void baseUriResolvesRelativeIri() throws ParserException {
+		Iterator<TripleString> it = asIt(getFile("importer/bnode_x.nt"));
+		TripleString first = it.next();
+		TripleString second = it.next();
+
+		assertEquals("_:mysupernode", first.getSubject().toString());
+		assertEquals(HDTTestUtils.BASE_URI + "p", first.getPredicate().toString());
+		assertEquals(HDTTestUtils.BASE_URI + "o", first.getObject().toString());
+		assertEquals(HDTTestUtils.BASE_URI + "s", second.getSubject().toString());
+		assertEquals(HDTTestUtils.BASE_URI + "p", second.getPredicate().toString());
+		assertEquals(HDTTestUtils.BASE_URI + "o", second.getObject().toString());
+		assertFalse(it.hasNext());
 	}
 }

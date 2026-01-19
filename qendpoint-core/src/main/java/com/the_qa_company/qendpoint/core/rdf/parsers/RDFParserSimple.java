@@ -31,6 +31,7 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.net.URI;
 
 /**
  * @author mario.arias
@@ -61,9 +62,19 @@ public class RDFParserSimple implements RDFParserCallback {
 			RDFCallback callback) throws ParserException {
 		if (notation == RDFNotation.NTRIPLES || notation == RDFNotation.NQUAD) {
 			boolean allowRelativeIri = isJenaCompatBaseUri(baseUri);
+			String parserBaseUri = allowRelativeIri ? null : baseUri;
 			try (InputStream in = input) {
 				RDFCallback strictCallback = (triple, pos) -> {
 					if (!allowRelativeIri) {
+						if (baseUri != null && !baseUri.isEmpty()) {
+							triple.setSubject(resolveRelativeIri(triple.getSubject(), baseUri));
+							triple.setPredicate(resolveRelativeIri(triple.getPredicate(), baseUri));
+							triple.setObject(resolveRelativeIri(triple.getObject(), baseUri));
+							triple.setObject(resolveRelativeDatatypeIri(triple.getObject(), baseUri));
+							if (triple instanceof QuadString quad) {
+								quad.setGraph(resolveRelativeIri(quad.getGraph(), baseUri));
+							}
+						}
 						requireAbsoluteIri(triple.getSubject(), "subject");
 						requireAbsoluteIri(triple.getPredicate(), "predicate");
 						requireAbsoluteIri(triple.getObject(), "object");
@@ -75,7 +86,7 @@ public class RDFParserSimple implements RDFParserCallback {
 					}
 					callback.processTriple(triple, pos);
 				};
-				riotParser.doParse(in, null, notation, true, strictCallback);
+				riotParser.doParse(in, parserBaseUri, notation, true, strictCallback);
 			} catch (IOException e) {
 				throw new ParserException(e);
 			}
@@ -147,8 +158,48 @@ public class RDFParserSimple implements RDFParserCallback {
 		}
 	}
 
+	private static CharSequence resolveRelativeIri(CharSequence value, String baseUri) {
+		if (!isIriToken(value) || isAbsoluteIri(value)) {
+			return value;
+		}
+		try {
+			return URI.create(baseUri).resolve(value.toString()).toString();
+		} catch (IllegalArgumentException e) {
+			return value;
+		}
+	}
+
 	private static boolean isJenaCompatBaseUri(String baseUri) {
 		return JENA_COMPAT_BASE_URI.equals(baseUri);
+	}
+
+	private static CharSequence resolveRelativeDatatypeIri(CharSequence literal, String baseUri) {
+		if (literal == null || literal.length() == 0 || literal.charAt(0) != '"') {
+			return literal;
+		}
+		int marker = indexOfToken(literal, "^^<");
+		if (marker == -1) {
+			return literal;
+		}
+		int start = marker + 3;
+		int end = indexOfChar(literal, '>', start);
+		if (end == -1) {
+			return literal;
+		}
+		CharSequence iri = literal.subSequence(start, end);
+		if (isAbsoluteIri(iri)) {
+			return literal;
+		}
+		try {
+			String resolved = URI.create(baseUri).resolve(iri.toString()).toString();
+			StringBuilder updated = new StringBuilder(literal.length() + resolved.length());
+			updated.append(literal, 0, start);
+			updated.append(resolved);
+			updated.append(literal, end, literal.length());
+			return updated.toString();
+		} catch (IllegalArgumentException e) {
+			return literal;
+		}
 	}
 
 	private static void requireAbsoluteDatatypeIri(CharSequence literal) {
