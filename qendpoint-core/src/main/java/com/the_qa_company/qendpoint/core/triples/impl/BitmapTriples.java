@@ -803,8 +803,6 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 				try (BucketedSequenceWriter writer = BucketedSequenceWriter.create(diskLocation,
 						"bitmapTriples-objectIndexBuckets", seqZ.getNumberOfElements(), bucketSize, bufferRecords)) {
 
-					// --- START OPTIMIZATION ---
-
 					// 1. Definition of the Batch Entry
 					class BatchEntry {
 						long originalIndex;
@@ -873,7 +871,6 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 							writer.add(insertBase + insertOffset, e.posY);
 						}
 					}
-					// --- END OPTIMIZATION ---
 
 					writer.materializeTo(objectArray, progressListener);
 				}
@@ -989,6 +986,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		this.adjIndex = new AdjacencyList(this.indexZ, this.bitmapIndexZ);
 
 		log.info("Index generated in {}", global.stopAndShow());
+
 	}
 
 	private void createIndexObjects() {
