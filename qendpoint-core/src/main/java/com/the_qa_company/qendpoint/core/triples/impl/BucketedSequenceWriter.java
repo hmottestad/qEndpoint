@@ -157,6 +157,39 @@ final class BucketedSequenceWriter implements Closeable {
 		}
 	}
 
+	void addBatch(long[] indexes, long[] values, int length) {
+		if (length <= 0) {
+			return;
+		}
+		if (indexes == null || values == null) {
+			throw new NullPointerException();
+		}
+		if (length > indexes.length || length > values.length) {
+			throw new IndexOutOfBoundsException();
+		}
+
+		for (int i = 0; i < length; i++) {
+			long index = indexes[i];
+			if (index < 0 || index >= totalEntries) {
+				throw new IndexOutOfBoundsException("index out of bounds: " + index);
+			}
+			long bucketLong = index / bucketSize;
+			int bucket = (int) bucketLong;
+			int offset = (int) (index - (long) bucket * bucketSize);
+			bucketBuffer[size] = bucket;
+			offsetBuffer[size] = offset;
+			valueBuffer[size] = values[i];
+			size++;
+			if (size == bucketBuffer.length) {
+				try {
+					flush();
+				} catch (IOException e) {
+					throw new RuntimeException(e);
+				}
+			}
+		}
+	}
+
 	void flush() throws IOException {
 		if (size == 0) {
 			return;

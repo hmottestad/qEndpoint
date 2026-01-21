@@ -44,9 +44,40 @@ public class BitmapTriplesObjectIndexParallelismTest {
 		}
 	}
 
+	@Test
+	public void pipelineEnabledWhenParallel() throws Exception {
+		Path root = tempDir.newFolder().toPath();
+		Path hdtPath = root.resolve("hdt.hdt");
+
+		try {
+			try (HDT hdt = LargeFakeDataSetStreamSupplier.createSupplierWithMaxTriples(2_000L, 42)
+					.createFakeHDT(new HDTSpecification())) {
+				hdt.saveToHDT(hdtPath.toAbsolutePath().toString(), null);
+			}
+
+			HDTOptions options = HDTOptions.of(HDTOptionsKeys.BITMAPTRIPLES_INDEX_METHOD_KEY,
+					HDTOptionsKeys.BITMAPTRIPLES_INDEX_METHOD_VALUE_OPTIMIZED,
+					HDTOptionsKeys.BITMAPTRIPLES_OBJECT_INDEX_PARALLELISM_KEY, 2);
+
+			try (HDT indexed = BitmapTriplesTest.loadOrMapIndexed(hdtPath, options, false)) {
+				BitmapTriples triples = (BitmapTriples) indexed.getTriples();
+				boolean enabled = readObjectIndexPipelineEnabled(triples);
+				assertEquals("object index pipeline enabled", true, enabled);
+			}
+		} finally {
+			PathUtils.deleteDirectory(root);
+		}
+	}
+
 	private static int readObjectIndexParallelism(BitmapTriples triples) throws Exception {
 		Field field = BitmapTriples.class.getDeclaredField("objectIndexParallelism");
 		field.setAccessible(true);
 		return (int) field.get(triples);
+	}
+
+	private static boolean readObjectIndexPipelineEnabled(BitmapTriples triples) throws Exception {
+		Field field = BitmapTriples.class.getDeclaredField("objectIndexPipelineEnabled");
+		field.setAccessible(true);
+		return (boolean) field.get(triples);
 	}
 }

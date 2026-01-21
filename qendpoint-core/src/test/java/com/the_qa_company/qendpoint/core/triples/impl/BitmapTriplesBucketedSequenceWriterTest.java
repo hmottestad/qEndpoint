@@ -93,6 +93,34 @@ public class BitmapTriplesBucketedSequenceWriterTest {
 		}
 	}
 
+	@Test
+	public void addBatchWritesRecords() throws Exception {
+		long totalEntries = 4L;
+		int bucketSize = 2;
+		int bufferRecords = 4;
+
+		try (CloseSuppressPath root = CloseSuppressPath.of(tempDir.newFolder().toPath())) {
+			root.closeWithDeleteRecurse();
+
+			BucketedSequenceWriter writer = new BucketedSequenceWriter(root, totalEntries, bucketSize, bufferRecords);
+			try {
+				long[] indexes = { 0L, 1L, 2L, 3L };
+				long[] values = { 9L, 7L, 5L, 3L };
+				writer.addBatch(indexes, values, indexes.length);
+
+				DynamicSequence sequence = new SequenceLog64(64, totalEntries, true);
+				writer.materializeTo(sequence);
+
+				assertEquals("value 0", 9L, sequence.get(0));
+				assertEquals("value 1", 7L, sequence.get(1));
+				assertEquals("value 2", 5L, sequence.get(2));
+				assertEquals("value 3", 3L, sequence.get(3));
+			} finally {
+				writer.close();
+			}
+		}
+	}
+
 	private static int readInt(byte[] buffer, int offset) {
 		return ((buffer[offset] & 0xff) << 24) | ((buffer[offset + 1] & 0xff) << 16)
 				| ((buffer[offset + 2] & 0xff) << 8) | (buffer[offset + 3] & 0xff);

@@ -88,8 +88,12 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.IntStream;
 
 /**
@@ -117,6 +121,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 
 	protected boolean isClosed;
 	private int objectIndexParallelism = 1;
+	private boolean objectIndexPipelineEnabled = false;
 
 	public BitmapTriples() throws IOException {
 		this(new HDTSpecification());
@@ -829,70 +834,54 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 				try (BucketedSequenceWriter writer = BucketedSequenceWriter.create(diskLocation,
 						"bitmapTriples-objectIndexBuckets", seqZ.getNumberOfElements(), bucketSize, bufferRecords)) {
 
-					// 1. Definition of the Batch Entry
-					class BatchEntry {
-						long originalIndex;
-						long objectValue;
-						long posY;
-					}
-
 					// 2. Setup Batching (128k)
 					final int BATCH_SIZE = 128 * 1024;
-					BatchEntry[] batch = new BatchEntry[BATCH_SIZE];
+					ObjectIndexEntry[] batch = new ObjectIndexEntry[BATCH_SIZE];
 					// Pre-allocate objects to avoid garbage collection churn in
 					// the loop
 					for (int k = 0; k < BATCH_SIZE; k++) {
-						batch[k] = new BatchEntry();
+						batch[k] = new ObjectIndexEntry();
 					}
 					int batchPtr = 0;
+					boolean usePipeline = objectIndexParallelism > 1;
+					objectIndexPipelineEnabled = usePipeline;
+					ObjectIndexPipeline pipeline = usePipeline
+							? new ObjectIndexPipeline(writer, BATCH_SIZE,
+									Math.min(4, Math.max(2, objectIndexParallelism)))
+							: null;
+					ObjectIndexBatch directBatch = usePipeline ? null : new ObjectIndexBatch(BATCH_SIZE);
 
-					// 3. Main Loop
-					for (long i = 0; i < seqZ.getNumberOfElements(); i++) {
-						long objectValue = seqZ.get(i);
+					try {
+						// 3. Main Loop
+						for (long i = 0; i < seqZ.getNumberOfElements(); i++) {
+							long objectValue = seqZ.get(i);
 
-						// Vital: Calculate posY NOW while 'i' is sequential.
-						// This keeps bitmapZ.rank1 fast.
-						long posY = i > 0 ? bitmapZ.rank1(i - 1) : 0;
+							// Vital: Calculate posY NOW while 'i' is
+							// sequential.
+							// This keeps bitmapZ.rank1 fast.
+							long posY = i > 0 ? bitmapZ.rank1(i - 1) : 0;
 
-						// Fill batch
-						BatchEntry entry = batch[batchPtr++];
-						entry.originalIndex = i;
-						entry.objectValue = objectValue;
-						entry.posY = posY;
+							// Fill batch
+							ObjectIndexEntry entry = batch[batchPtr++];
+							entry.objectValue = objectValue;
+							entry.posY = posY;
 
-						// 4. Process Batch if full
-						if (batchPtr == BATCH_SIZE) {
-							// Sort by objectValue to optimize select1.
-							// Parallel sort is stable, keeping originalIndex
-							// order for identical values.
-							Arrays.parallelSort(batch, 0, batchPtr, Comparator.comparingLong(o -> o.objectValue));
-
-							for (int k = 0; k < batchPtr; k++) {
-								BatchEntry e = batch[k];
-
-								long insertBase = objectStart.get(e.objectValue - 1);
-								long insertOffset = objectInsertedCount.get(e.objectValue - 1);
-								objectInsertedCount.set(e.objectValue - 1, insertOffset + 1);
-
-								writer.add(insertBase + insertOffset, e.posY);
+							// 4. Process Batch if full
+							if (batchPtr == BATCH_SIZE) {
+								writeObjectIndexBatch(batch, batchPtr, objectStart, objectInsertedCount, writer,
+										pipeline, directBatch);
+								batchPtr = 0;
 							}
-							batchPtr = 0;
 						}
-					}
 
-					// 5. Process Remaining Batch
-					if (batchPtr > 0) {
-						java.util.Arrays.parallelSort(batch, 0, batchPtr,
-								(o1, o2) -> Long.compare(o1.objectValue, o2.objectValue));
-
-						for (int k = 0; k < batchPtr; k++) {
-							BatchEntry e = batch[k];
-
-							long insertBase = objectStart.get(e.objectValue - 1);
-							long insertOffset = objectInsertedCount.get(e.objectValue - 1);
-							objectInsertedCount.set(e.objectValue - 1, insertOffset + 1);
-
-							writer.add(insertBase + insertOffset, e.posY);
+						// 5. Process Remaining Batch
+						if (batchPtr > 0) {
+							writeObjectIndexBatch(batch, batchPtr, objectStart, objectInsertedCount, writer, pipeline,
+									directBatch);
+						}
+					} finally {
+						if (pipeline != null) {
+							pipeline.close();
 						}
 					}
 
@@ -965,6 +954,46 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 
 		log.info("Index generated in {}", global.stopAndShow());
 
+	}
+
+	private void writeObjectIndexBatch(ObjectIndexEntry[] batch, int batchPtr, DynamicSequence objectStart,
+			DynamicSequence objectInsertedCount, BucketedSequenceWriter writer, ObjectIndexPipeline pipeline,
+			ObjectIndexBatch directBatch) {
+		Arrays.parallelSort(batch, 0, batchPtr, Comparator.comparingLong(o -> o.objectValue));
+
+		ObjectIndexBatch target = pipeline != null ? pipeline.acquire() : directBatch;
+		target.length = batchPtr;
+
+		long currentObject = -1L;
+		long insertBase = 0L;
+		long insertOffset = 0L;
+
+		for (int k = 0; k < batchPtr; k++) {
+			ObjectIndexEntry entry = batch[k];
+			long objectValue = entry.objectValue;
+			if (objectValue != currentObject) {
+				if (currentObject != -1L) {
+					objectInsertedCount.set(currentObject - 1, insertOffset);
+				}
+				currentObject = objectValue;
+				insertBase = objectStart.get(objectValue - 1);
+				insertOffset = objectInsertedCount.get(objectValue - 1);
+			}
+
+			target.indexes[k] = insertBase + insertOffset;
+			target.values[k] = entry.posY;
+			insertOffset++;
+		}
+
+		if (currentObject != -1L) {
+			objectInsertedCount.set(currentObject - 1, insertOffset);
+		}
+
+		if (pipeline != null) {
+			pipeline.submit(target);
+		} else {
+			writer.addBatch(target.indexes, target.values, target.length);
+		}
 	}
 
 	private void sortObjectSublists(Sequence seqY, DynamicSequence objectArray, ModifiableBitmap bitmapIndex,
@@ -1163,6 +1192,118 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		private ObjectSortRange(long start, int length) {
 			this.start = start;
 			this.length = length;
+		}
+	}
+
+	private static final class ObjectIndexEntry {
+		private long objectValue;
+		private long posY;
+	}
+
+	private static final class ObjectIndexBatch {
+		private final long[] indexes;
+		private final long[] values;
+		private int length;
+
+		private ObjectIndexBatch(int capacity) {
+			this.indexes = new long[capacity];
+			this.values = new long[capacity];
+		}
+	}
+
+	private static final class ObjectIndexPipeline implements AutoCloseable {
+		private static final long QUEUE_WAIT_TIMEOUT_MS = 250L;
+		private final BlockingQueue<ObjectIndexBatch> freeBatches;
+		private final BlockingQueue<ObjectIndexBatch> readyBatches;
+		private final ObjectIndexBatch poison;
+		private final Thread worker;
+		private final AtomicReference<Throwable> error;
+		private final BucketedSequenceWriter writer;
+
+		private ObjectIndexPipeline(BucketedSequenceWriter writer, int batchSize, int depth) {
+			this.writer = writer;
+			int capacity = Math.max(1, depth);
+			freeBatches = new ArrayBlockingQueue<>(capacity);
+			readyBatches = new ArrayBlockingQueue<>(capacity);
+			for (int i = 0; i < capacity; i++) {
+				freeBatches.add(new ObjectIndexBatch(batchSize));
+			}
+			poison = new ObjectIndexBatch(0);
+			error = new AtomicReference<>();
+			worker = new Thread(this::run, "BitmapTriples-object-index-writer");
+			worker.setDaemon(true);
+			worker.start();
+		}
+
+		private void run() {
+			try {
+				while (true) {
+					ObjectIndexBatch batch = take(readyBatches);
+					if (batch == poison) {
+						return;
+					}
+					writer.addBatch(batch.indexes, batch.values, batch.length);
+					batch.length = 0;
+					put(freeBatches, batch);
+				}
+			} catch (Throwable t) {
+				error.set(t);
+			}
+		}
+
+		private ObjectIndexBatch acquire() {
+			checkError();
+			return take(freeBatches);
+		}
+
+		private void submit(ObjectIndexBatch batch) {
+			checkError();
+			put(readyBatches, batch);
+		}
+
+		@Override
+		public void close() {
+			put(readyBatches, poison);
+			try {
+				worker.join();
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
+			checkError();
+		}
+
+		private void checkError() {
+			Throwable t = error.get();
+			if (t != null) {
+				throw new RuntimeException(t);
+			}
+		}
+
+		private static ObjectIndexBatch take(BlockingQueue<ObjectIndexBatch> queue) {
+			while (true) {
+				try {
+					ObjectIndexBatch batch = queue.poll(QUEUE_WAIT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+					if (batch != null) {
+						return batch;
+					}
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+					throw new RuntimeException(e);
+				}
+			}
+		}
+
+		private static void put(BlockingQueue<ObjectIndexBatch> queue, ObjectIndexBatch batch) {
+			while (true) {
+				try {
+					if (queue.offer(batch, QUEUE_WAIT_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+						return;
+					}
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+					throw new RuntimeException(e);
+				}
+			}
 		}
 	}
 
