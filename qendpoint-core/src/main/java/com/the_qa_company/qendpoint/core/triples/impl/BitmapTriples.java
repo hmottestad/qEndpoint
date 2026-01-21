@@ -88,6 +88,9 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ForkJoinPool;
+import java.util.stream.IntStream;
 
 /**
  * @author mario.arias
@@ -113,6 +116,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 	CreateOnUsePath diskSequenceLocation;
 
 	protected boolean isClosed;
+	private int objectIndexParallelism = 1;
 
 	public BitmapTriples() throws IOException {
 		this(new HDTSpecification());
@@ -175,6 +179,21 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		} else {
 			diskSequenceLocation = null;
 		}
+	}
+
+	private int resolveObjectIndexParallelism(HDTOptions spec) {
+		if (spec == null) {
+			return 1;
+		}
+		long configured = spec.getInt(HDTOptionsKeys.BITMAPTRIPLES_OBJECT_INDEX_PARALLELISM_KEY, 1);
+		if (configured == 0) {
+			configured = Runtime.getRuntime().availableProcessors();
+		}
+		if (configured < 0 || configured >= Integer.MAX_VALUE - 5L) {
+			throw new IllegalArgumentException("Invalid value for "
+					+ HDTOptionsKeys.BITMAPTRIPLES_OBJECT_INDEX_PARALLELISM_KEY + ": " + configured);
+		}
+		return (int) Math.max(1L, configured);
 	}
 
 	public CreateOnUsePath getDiskSequenceLocation() {
@@ -748,44 +767,51 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		long numDifferentObjects = 0;
 		long numReservedObjects = 8192;
 		ModifiableBitmap bitmapIndex = null;
+		DynamicSequence objectStart = null;
 		DynamicSequence predCount = null;
 		DynamicSequence objectArray = null;
 
 		try {
-			try (DynamicSequence objectCount = createSequence64(diskLocation, "objectCount",
-					BitUtil.log2(seqZ.getNumberOfElements()), numReservedObjects)) {
-				for (long i = 0; i < seqZ.getNumberOfElements(); i++) {
-					long val = seqZ.get(i);
-					if (val == 0) {
-						throw new RuntimeException("ERROR: There is a zero value in the Z level.");
-					}
-					if (numReservedObjects < val) {
-						while (numReservedObjects < val) {
-							numReservedObjects <<= 1;
-						}
-						objectCount.resize(numReservedObjects);
-					}
-					if (numDifferentObjects < val) {
-						numDifferentObjects = val;
-					}
-
-					long count = objectCount.get(val - 1) + 1;
-					maxCount = Math.max(count, maxCount);
-					objectCount.set(val - 1, count);
+			objectStart = createSequence64(diskLocation, "objectCount", BitUtil.log2(seqZ.getNumberOfElements()),
+					numReservedObjects);
+			for (long i = 0; i < seqZ.getNumberOfElements(); i++) {
+				long val = seqZ.get(i);
+				if (val == 0) {
+					throw new RuntimeException("ERROR: There is a zero value in the Z level.");
 				}
-				log.info("Count Objects in {} Max was: {}", st.stopAndShow(), maxCount);
-				st.reset();
-
-				// Calculate bitmap that separates each object sublist.
-				bitmapIndex = createBitmap375(diskLocation, "bitmapIndex", seqZ.getNumberOfElements());
-				long tmpCount = 0;
-				for (long i = 0; i < numDifferentObjects; i++) {
-					tmpCount += objectCount.get(i);
-					bitmapIndex.set(tmpCount - 1, true);
+				if (numReservedObjects < val) {
+					while (numReservedObjects < val) {
+						numReservedObjects <<= 1;
+					}
+					objectStart.resize(numReservedObjects);
 				}
-				bitmapIndex.set(seqZ.getNumberOfElements() - 1, true);
-				log.info("Bitmap in {}", st.stopAndShow());
+				if (numDifferentObjects < val) {
+					numDifferentObjects = val;
+				}
+
+				long count = objectStart.get(val - 1) + 1;
+				maxCount = Math.max(count, maxCount);
+				objectStart.set(val - 1, count);
 			}
+			log.info("Count Objects in {} Max was: {}", st.stopAndShow(), maxCount);
+			st.reset();
+
+			// Calculate bitmap that separates each object sublist and prefix
+			// starts.
+			bitmapIndex = createBitmap375(diskLocation, "bitmapIndex", seqZ.getNumberOfElements());
+			long tmpCount = 0;
+			for (long i = 0; i < numDifferentObjects; i++) {
+				long count = objectStart.get(i);
+				if (count != 0) {
+					bitmapIndex.set(tmpCount + count - 1, true);
+				}
+				objectStart.set(i, tmpCount);
+				tmpCount += count;
+			}
+			if (seqZ.getNumberOfElements() > 0) {
+				bitmapIndex.set(seqZ.getNumberOfElements() - 1, true);
+			}
+			log.info("Bitmap in {}", st.stopAndShow());
 			st.reset();
 
 			objectArray = createSequence64(diskLocation, "objectArray", BitUtil.log2(seqY.getNumberOfElements()),
@@ -844,9 +870,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 							for (int k = 0; k < batchPtr; k++) {
 								BatchEntry e = batch[k];
 
-								// Since 'e.objectValue' is now ordered, select1
-								// is sequential/monotonic
-								long insertBase = e.objectValue == 1 ? 0 : bitmapIndex.select1(e.objectValue - 1) + 1;
+								long insertBase = objectStart.get(e.objectValue - 1);
 								long insertOffset = objectInsertedCount.get(e.objectValue - 1);
 								objectInsertedCount.set(e.objectValue - 1, insertOffset + 1);
 
@@ -864,7 +888,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 						for (int k = 0; k < batchPtr; k++) {
 							BatchEntry e = batch[k];
 
-							long insertBase = e.objectValue == 1 ? 0 : bitmapIndex.select1(e.objectValue - 1) + 1;
+							long insertBase = objectStart.get(e.objectValue - 1);
 							long insertOffset = objectInsertedCount.get(e.objectValue - 1);
 							objectInsertedCount.set(e.objectValue - 1, insertOffset + 1);
 
@@ -876,67 +900,15 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 				}
 				log.info("Object references in {}", st.stopAndShow());
 			}
+			IOUtil.closeObject(objectStart);
+			objectStart = null;
 			st.reset();
 
-			long object = 1;
-			long first = 0;
-			long last = bitmapIndex.selectNext1(first) + 1;
-			do {
-				long listLen = last - first;
-
-				// Sublists of one element do not need to be sorted.
-
-				// Hard-coded size 2 for speed (They are quite common).
-				if (listLen == 2) {
-					long aPos = objectArray.get(first);
-					long a = seqY.get(aPos);
-					long bPos = objectArray.get(first + 1);
-					long b = seqY.get(bPos);
-					if (a > b) {
-						objectArray.set(first, bPos);
-						objectArray.set(first + 1, aPos);
-					}
-				} else if (listLen > 2) {
-					class Pair {
-						Long valueY;
-						Long positionY;
-
-						@Override
-						public String toString() {
-							return String.format("%d %d", valueY, positionY);
-						}
-					}
-
-					// FIXME: Sort directly without copying?
-					ArrayList<Pair> list = new ArrayList<>((int) listLen);
-
-					// Create temporary list of (position, predicate)
-					for (long i = first; i < last; i++) {
-						Pair p = new Pair();
-						p.positionY = objectArray.get(i);
-						p.valueY = seqY.get(p.positionY);
-						list.add(p);
-					}
-
-					// Sort
-					list.sort((Pair o1, Pair o2) -> {
-						if (o1.valueY.equals(o2.valueY)) {
-							return o1.positionY.compareTo(o2.positionY);
-						}
-						return o1.valueY.compareTo(o2.valueY);
-					});
-
-					// Copy back
-					for (long i = first; i < last; i++) {
-						Pair pair = list.get((int) (i - first));
-						objectArray.set(i, pair.positionY);
-					}
-				}
-
-				first = last;
-				last = bitmapIndex.selectNext1(first) + 1;
-				object++;
-			} while (object <= numDifferentObjects);
+			int parallelism = objectIndexParallelism;
+			if (numDifferentObjects > 0 && numDifferentObjects < parallelism) {
+				parallelism = (int) numDifferentObjects;
+			}
+			sortObjectSublists(seqY, objectArray, bitmapIndex, numDifferentObjects, parallelism);
 
 			log.info("Sort object sublists in {}", st.stopAndShow());
 			st.reset();
@@ -969,8 +941,14 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 							objectArray.close();
 						}
 					} finally {
-						if (predCount != null) {
-							predCount.close();
+						try {
+							if (predCount != null) {
+								predCount.close();
+							}
+						} finally {
+							if (objectStart != null) {
+								objectStart.close();
+							}
 						}
 					}
 				}
@@ -987,6 +965,205 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 
 		log.info("Index generated in {}", global.stopAndShow());
 
+	}
+
+	private void sortObjectSublists(Sequence seqY, DynamicSequence objectArray, ModifiableBitmap bitmapIndex,
+			long numDifferentObjects, int parallelism) {
+		if (numDifferentObjects <= 1) {
+			return;
+		}
+		if (parallelism <= 1) {
+			sortObjectSublistsSequential(seqY, objectArray, bitmapIndex, numDifferentObjects);
+			return;
+		}
+		sortObjectSublistsParallel(seqY, objectArray, bitmapIndex, numDifferentObjects, parallelism);
+	}
+
+	private void sortObjectSublistsSequential(Sequence seqY, DynamicSequence objectArray, ModifiableBitmap bitmapIndex,
+			long numDifferentObjects) {
+		long object = 1;
+		long first = 0;
+		long last = bitmapIndex.selectNext1(first) + 1;
+		do {
+			sortObjectRangeSequential(seqY, objectArray, first, last);
+			first = last;
+			last = bitmapIndex.selectNext1(first) + 1;
+			object++;
+		} while (object <= numDifferentObjects);
+	}
+
+	private void sortObjectSublistsParallel(Sequence seqY, DynamicSequence objectArray, ModifiableBitmap bitmapIndex,
+			long numDifferentObjects, int parallelism) {
+		long batchLimit = resolveObjectIndexSortBatchEntries(objectArray.getNumberOfElements(), parallelism);
+		ForkJoinPool pool = new ForkJoinPool(parallelism);
+		try {
+			List<ObjectSortRange> ranges = new ArrayList<>();
+			long batchEntries = 0L;
+
+			long object = 1;
+			long first = 0;
+			long last = bitmapIndex.selectNext1(first) + 1;
+			do {
+				long listLen = last - first;
+				if (listLen > 2) {
+					if (listLen > Integer.MAX_VALUE) {
+						throw new IllegalArgumentException("Object list too large to sort: " + listLen);
+					}
+					ranges.add(new ObjectSortRange(first, (int) listLen));
+					batchEntries += listLen;
+					if (batchEntries >= batchLimit) {
+						sortObjectRangesBatch(pool, ranges, seqY, objectArray);
+						ranges.clear();
+						batchEntries = 0L;
+					}
+				} else if (listLen > 1) {
+					sortObjectRangeSequential(seqY, objectArray, first, last);
+				}
+				first = last;
+				last = bitmapIndex.selectNext1(first) + 1;
+				object++;
+			} while (object <= numDifferentObjects);
+
+			if (!ranges.isEmpty()) {
+				sortObjectRangesBatch(pool, ranges, seqY, objectArray);
+			}
+		} finally {
+			pool.shutdown();
+		}
+	}
+
+	private void sortObjectRangesBatch(ForkJoinPool pool, List<ObjectSortRange> ranges, Sequence seqY,
+			DynamicSequence objectArray) {
+		int rangeCount = ranges.size();
+		long[][] sortedPositions = new long[rangeCount][];
+		try {
+			pool.submit(() -> IntStream.range(0, rangeCount).parallel().forEach(index -> {
+				ObjectSortRange range = ranges.get(index);
+				sortedPositions[index] = buildSortedPositions(seqY, objectArray, range.start, range.length);
+			})).get();
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			throw new RuntimeException(e);
+		} catch (ExecutionException e) {
+			throw new RuntimeException(e.getCause());
+		}
+
+		for (int i = 0; i < rangeCount; i++) {
+			long[] positions = sortedPositions[i];
+			if (positions == null) {
+				continue;
+			}
+			ObjectSortRange range = ranges.get(i);
+			long start = range.start;
+			for (int j = 0; j < positions.length; j++) {
+				objectArray.set(start + j, positions[j]);
+			}
+		}
+	}
+
+	private void sortObjectRangeSequential(Sequence seqY, DynamicSequence objectArray, long first, long last) {
+		long listLen = last - first;
+		if (listLen <= 1) {
+			return;
+		}
+		if (listLen > Integer.MAX_VALUE) {
+			throw new IllegalArgumentException("Object list too large to sort: " + listLen);
+		}
+		int length = (int) listLen;
+		if (length == 2) {
+			long aPos = objectArray.get(first);
+			long bPos = objectArray.get(first + 1);
+			long a = seqY.get(aPos);
+			long b = seqY.get(bPos);
+			if (a > b) {
+				objectArray.set(first, bPos);
+				objectArray.set(first + 1, aPos);
+			}
+			return;
+		}
+
+		long[] positions = buildSortedPositions(seqY, objectArray, first, length);
+		for (int i = 0; i < positions.length; i++) {
+			objectArray.set(first + i, positions[i]);
+		}
+	}
+
+	private static long[] buildSortedPositions(Sequence seqY, DynamicSequence objectArray, long start, int length) {
+		long[] positions = new long[length];
+		long[] values = new long[length];
+		for (int i = 0; i < length; i++) {
+			long pos = objectArray.get(start + i);
+			positions[i] = pos;
+			values[i] = seqY.get(pos);
+		}
+		sortByValueThenPosition(values, positions, 0, length);
+		return positions;
+	}
+
+	private static void sortByValueThenPosition(long[] values, long[] positions, int from, int to) {
+		int left = from;
+		int right = to - 1;
+		if (left >= right) {
+			return;
+		}
+
+		int mid = left + ((right - left) >>> 1);
+		long pivotValue = values[mid];
+		long pivotPosition = positions[mid];
+		int i = left;
+		int j = right;
+
+		while (i <= j) {
+			while (comparePair(values[i], positions[i], pivotValue, pivotPosition) < 0) {
+				i++;
+			}
+			while (comparePair(values[j], positions[j], pivotValue, pivotPosition) > 0) {
+				j--;
+			}
+			if (i <= j) {
+				long tmpValue = values[i];
+				values[i] = values[j];
+				values[j] = tmpValue;
+
+				long tmpPosition = positions[i];
+				positions[i] = positions[j];
+				positions[j] = tmpPosition;
+
+				i++;
+				j--;
+			}
+		}
+
+		if (from < j + 1) {
+			sortByValueThenPosition(values, positions, from, j + 1);
+		}
+		if (i < to) {
+			sortByValueThenPosition(values, positions, i, to);
+		}
+	}
+
+	private static int comparePair(long valueA, long positionA, long valueB, long positionB) {
+		int cmp = Long.compare(valueA, valueB);
+		if (cmp != 0) {
+			return cmp;
+		}
+		return Long.compare(positionA, positionB);
+	}
+
+	private static long resolveObjectIndexSortBatchEntries(long totalEntries, int parallelism) {
+		long base = totalEntries / Math.max(1L, parallelism * 4L);
+		long target = Math.max(100_000L, base);
+		return Math.max(1L, Math.min(1_000_000L, target));
+	}
+
+	private static final class ObjectSortRange {
+		private final long start;
+		private final int length;
+
+		private ObjectSortRange(long start, int length) {
+			this.start = start;
+			this.length = length;
+		}
 	}
 
 	private void createIndexObjects() {
@@ -1082,6 +1259,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 	public void generateIndex(ProgressListener listener, HDTOptions specIndex, Dictionary dictionary)
 			throws IOException {
 		loadDiskSequence(specIndex);
+		objectIndexParallelism = resolveObjectIndexParallelism(specIndex);
 
 		String indexMethod = specIndex.get(HDTOptionsKeys.BITMAPTRIPLES_INDEX_METHOD_KEY,
 				HDTOptionsKeys.BITMAPTRIPLES_INDEX_METHOD_VALUE_RECOMMENDED);

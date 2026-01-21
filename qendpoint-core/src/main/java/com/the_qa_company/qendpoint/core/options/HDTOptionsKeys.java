@@ -526,6 +526,9 @@ public class HDTOptionsKeys {
 	@Value(key = BITMAPTRIPLES_INDEX_METHOD_KEY, desc = "Memory optimized option")
 	public static final String BITMAPTRIPLES_INDEX_METHOD_VALUE_OPTIMIZED = "optimized";
 
+	@Key(type = Key.Type.NUMBER, desc = "Parallelism for bitmaptriples object index sort, 0 uses available processors")
+	public static final String BITMAPTRIPLES_OBJECT_INDEX_PARALLELISM_KEY = "bitmaptriples.indexmethod.objectIndex.parallelism";
+
 	/**
 	 * Key for the {@link HDTManager} loadIndexed methods, say the number of
 	 * workers to merge the data. default to the number of processor. long
