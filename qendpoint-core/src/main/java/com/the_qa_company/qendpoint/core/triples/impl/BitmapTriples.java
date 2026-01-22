@@ -101,6 +101,8 @@ import java.util.stream.IntStream;
  */
 public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 	private static final Logger log = LoggerFactory.getLogger(BitmapTriples.class);
+	private static final int OBJECT_INDEX_PARALLEL_FILL_MIN_RECORDS = 1 << 15;
+	private static final int OBJECT_INDEX_PARALLEL_FILL_MIN_GROUPS = 4;
 
 	protected TripleComponentOrder order;
 
@@ -122,6 +124,9 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 	protected boolean isClosed;
 	private int objectIndexParallelism = 1;
 	private boolean objectIndexPipelineEnabled = false;
+	private boolean objectIndexBucketParallelWritesEnabled = false;
+	private boolean objectIndexBatchParallelFillEnabled = false;
+	private boolean objectIndexBatchProcessingPipelineEnabled = false;
 
 	public BitmapTriples() throws IOException {
 		this(new HDTSpecification());
@@ -833,23 +838,48 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 						bucketSize);
 				try (BucketedSequenceWriter writer = BucketedSequenceWriter.create(diskLocation,
 						"bitmapTriples-objectIndexBuckets", seqZ.getNumberOfElements(), bucketSize, bufferRecords)) {
+					boolean bucketParallelWrites = objectIndexParallelism > 1;
+					objectIndexBucketParallelWritesEnabled = bucketParallelWrites;
+					if (bucketParallelWrites) {
+						writer.setWriteParallelism(objectIndexParallelism);
+					}
 
 					// 2. Setup Batching (128k)
 					final int BATCH_SIZE = 128 * 1024;
-					ObjectIndexEntry[] batch = new ObjectIndexEntry[BATCH_SIZE];
-					// Pre-allocate objects to avoid garbage collection churn in
-					// the loop
-					for (int k = 0; k < BATCH_SIZE; k++) {
-						batch[k] = new ObjectIndexEntry();
-					}
-					int batchPtr = 0;
 					boolean usePipeline = objectIndexParallelism > 1;
 					objectIndexPipelineEnabled = usePipeline;
+					boolean useParallelFill = objectIndexParallelism > 1;
+					objectIndexBatchParallelFillEnabled = useParallelFill;
+					boolean useBatchPipeline = objectIndexParallelism > 1;
+					objectIndexBatchProcessingPipelineEnabled = useBatchPipeline;
+					int pipelineDepth = Math.min(4, Math.max(2, objectIndexParallelism));
 					ObjectIndexPipeline pipeline = usePipeline
-							? new ObjectIndexPipeline(writer, BATCH_SIZE,
-									Math.min(4, Math.max(2, objectIndexParallelism)))
+							? new ObjectIndexPipeline(writer, BATCH_SIZE, pipelineDepth)
 							: null;
 					ObjectIndexBatch directBatch = usePipeline ? null : new ObjectIndexBatch(BATCH_SIZE);
+					ObjectIndexBatchScratch batchScratch = useBatchPipeline ? null
+							: new ObjectIndexBatchScratch(BATCH_SIZE);
+					ForkJoinPool fillPool = useBatchPipeline ? null
+							: useParallelFill ? new ForkJoinPool(objectIndexParallelism) : null;
+					ObjectIndexBatchPipeline batchPipeline = useBatchPipeline
+							? new ObjectIndexBatchPipeline(this, BATCH_SIZE, pipelineDepth, objectIndexParallelism,
+									objectStart, objectInsertedCount, writer, pipeline, directBatch)
+							: null;
+					ObjectIndexEntryBatch entryBatch = null;
+					ObjectIndexEntry[] batch;
+					if (batchPipeline != null) {
+						entryBatch = batchPipeline.acquire();
+						batch = entryBatch.entries;
+					} else {
+						batch = new ObjectIndexEntry[BATCH_SIZE];
+						// Pre-allocate objects to avoid garbage collection
+						// churn
+						// in the loop
+						for (int k = 0; k < BATCH_SIZE; k++) {
+							batch[k] = new ObjectIndexEntry();
+						}
+					}
+					int batchPtr = 0;
 
 					try {
 						// 3. Main Loop
@@ -868,20 +898,38 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 
 							// 4. Process Batch if full
 							if (batchPtr == BATCH_SIZE) {
-								writeObjectIndexBatch(batch, batchPtr, objectStart, objectInsertedCount, writer,
-										pipeline, directBatch);
+								if (batchPipeline != null) {
+									entryBatch.length = batchPtr;
+									batchPipeline.submit(entryBatch);
+									entryBatch = batchPipeline.acquire();
+									batch = entryBatch.entries;
+								} else {
+									writeObjectIndexBatch(batch, batchPtr, objectStart, objectInsertedCount, writer,
+											pipeline, directBatch, batchScratch, fillPool);
+								}
 								batchPtr = 0;
 							}
 						}
 
 						// 5. Process Remaining Batch
 						if (batchPtr > 0) {
-							writeObjectIndexBatch(batch, batchPtr, objectStart, objectInsertedCount, writer, pipeline,
-									directBatch);
+							if (batchPipeline != null) {
+								entryBatch.length = batchPtr;
+								batchPipeline.submit(entryBatch);
+							} else {
+								writeObjectIndexBatch(batch, batchPtr, objectStart, objectInsertedCount, writer,
+										pipeline, directBatch, batchScratch, fillPool);
+							}
 						}
 					} finally {
+						if (batchPipeline != null) {
+							batchPipeline.close();
+						}
 						if (pipeline != null) {
 							pipeline.close();
+						}
+						if (fillPool != null) {
+							fillPool.shutdown();
 						}
 					}
 
@@ -958,35 +1006,87 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 
 	private void writeObjectIndexBatch(ObjectIndexEntry[] batch, int batchPtr, DynamicSequence objectStart,
 			DynamicSequence objectInsertedCount, BucketedSequenceWriter writer, ObjectIndexPipeline pipeline,
-			ObjectIndexBatch directBatch) {
+			ObjectIndexBatch directBatch, ObjectIndexBatchScratch scratch, ForkJoinPool fillPool) {
 		Arrays.parallelSort(batch, 0, batchPtr, Comparator.comparingLong(o -> o.objectValue));
 
 		ObjectIndexBatch target = pipeline != null ? pipeline.acquire() : directBatch;
 		target.length = batchPtr;
 
-		long currentObject = -1L;
-		long insertBase = 0L;
-		long insertOffset = 0L;
+		long[] groupObjects = scratch.groupObjects;
+		int[] groupStarts = scratch.groupStarts;
+		int[] groupLengths = scratch.groupLengths;
+		long[] groupBases = scratch.groupBases;
+		long[] groupOffsets = scratch.groupOffsets;
 
+		int groupCount = 0;
+		long currentObject = -1L;
+		int groupStart = 0;
 		for (int k = 0; k < batchPtr; k++) {
-			ObjectIndexEntry entry = batch[k];
-			long objectValue = entry.objectValue;
+			long objectValue = batch[k].objectValue;
 			if (objectValue != currentObject) {
 				if (currentObject != -1L) {
-					objectInsertedCount.set(currentObject - 1, insertOffset);
+					groupObjects[groupCount] = currentObject;
+					groupStarts[groupCount] = groupStart;
+					groupLengths[groupCount] = k - groupStart;
+					groupCount++;
 				}
 				currentObject = objectValue;
-				insertBase = objectStart.get(objectValue - 1);
-				insertOffset = objectInsertedCount.get(objectValue - 1);
+				groupStart = k;
 			}
-
-			target.indexes[k] = insertBase + insertOffset;
-			target.values[k] = entry.posY;
-			insertOffset++;
+		}
+		if (currentObject != -1L) {
+			groupObjects[groupCount] = currentObject;
+			groupStarts[groupCount] = groupStart;
+			groupLengths[groupCount] = batchPtr - groupStart;
+			groupCount++;
 		}
 
-		if (currentObject != -1L) {
-			objectInsertedCount.set(currentObject - 1, insertOffset);
+		for (int g = 0; g < groupCount; g++) {
+			long objectValue = groupObjects[g];
+			groupBases[g] = objectStart.get(objectValue - 1);
+			groupOffsets[g] = objectInsertedCount.get(objectValue - 1);
+		}
+
+		long[] indexes = target.indexes;
+		long[] values = target.values;
+		int groupCountFinal = groupCount;
+		boolean parallelFill = fillPool != null && shouldParallelFill(batchPtr, groupCountFinal);
+		if (parallelFill) {
+			try {
+				fillPool.submit(() -> IntStream.range(0, groupCountFinal).parallel().forEach(g -> {
+					long base = groupBases[g];
+					long offset = groupOffsets[g];
+					int start = groupStarts[g];
+					int length = groupLengths[g];
+					for (int i = 0; i < length; i++) {
+						int idx = start + i;
+						indexes[idx] = base + offset + i;
+						values[idx] = batch[idx].posY;
+					}
+				})).get();
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				throw new RuntimeException(e);
+			} catch (ExecutionException e) {
+				throw new RuntimeException(e.getCause());
+			}
+		} else {
+			for (int g = 0; g < groupCount; g++) {
+				long base = groupBases[g];
+				long offset = groupOffsets[g];
+				int start = groupStarts[g];
+				int length = groupLengths[g];
+				for (int i = 0; i < length; i++) {
+					int idx = start + i;
+					indexes[idx] = base + offset + i;
+					values[idx] = batch[idx].posY;
+				}
+			}
+		}
+
+		for (int g = 0; g < groupCount; g++) {
+			long objectValue = groupObjects[g];
+			objectInsertedCount.set(objectValue - 1, groupOffsets[g] + groupLengths[g]);
 		}
 
 		if (pipeline != null) {
@@ -994,6 +1094,17 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		} else {
 			writer.addBatch(target.indexes, target.values, target.length);
 		}
+	}
+
+	private boolean shouldParallelFill(int batchSize, int groupCount) {
+		if (objectIndexParallelism <= 1) {
+			return false;
+		}
+		if (batchSize < OBJECT_INDEX_PARALLEL_FILL_MIN_RECORDS) {
+			return false;
+		}
+		int minGroups = Math.max(OBJECT_INDEX_PARALLEL_FILL_MIN_GROUPS, objectIndexParallelism);
+		return groupCount >= minGroups;
 	}
 
 	private void sortObjectSublists(Sequence seqY, DynamicSequence objectArray, ModifiableBitmap bitmapIndex,
@@ -1200,6 +1311,18 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		private long posY;
 	}
 
+	private static final class ObjectIndexEntryBatch {
+		private final ObjectIndexEntry[] entries;
+		private int length;
+
+		private ObjectIndexEntryBatch(int capacity) {
+			this.entries = new ObjectIndexEntry[capacity];
+			for (int i = 0; i < capacity; i++) {
+				entries[i] = new ObjectIndexEntry();
+			}
+		}
+	}
+
 	private static final class ObjectIndexBatch {
 		private final long[] indexes;
 		private final long[] values;
@@ -1208,6 +1331,138 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		private ObjectIndexBatch(int capacity) {
 			this.indexes = new long[capacity];
 			this.values = new long[capacity];
+		}
+	}
+
+	private static final class ObjectIndexBatchScratch {
+		private final long[] groupObjects;
+		private final int[] groupStarts;
+		private final int[] groupLengths;
+		private final long[] groupBases;
+		private final long[] groupOffsets;
+
+		private ObjectIndexBatchScratch(int capacity) {
+			groupObjects = new long[capacity];
+			groupStarts = new int[capacity];
+			groupLengths = new int[capacity];
+			groupBases = new long[capacity];
+			groupOffsets = new long[capacity];
+		}
+	}
+
+	private static final class ObjectIndexBatchPipeline implements AutoCloseable {
+		private static final long QUEUE_WAIT_TIMEOUT_MS = 250L;
+		private final BitmapTriples owner;
+		private final BlockingQueue<ObjectIndexEntryBatch> freeBatches;
+		private final BlockingQueue<ObjectIndexEntryBatch> readyBatches;
+		private final ObjectIndexEntryBatch poison;
+		private final Thread worker;
+		private final AtomicReference<Throwable> error;
+		private final DynamicSequence objectStart;
+		private final DynamicSequence objectInsertedCount;
+		private final BucketedSequenceWriter writer;
+		private final ObjectIndexPipeline pipeline;
+		private final ObjectIndexBatch directBatch;
+		private final ObjectIndexBatchScratch scratch;
+		private final ForkJoinPool fillPool;
+
+		private ObjectIndexBatchPipeline(BitmapTriples owner, int batchSize, int depth, int parallelism,
+				DynamicSequence objectStart, DynamicSequence objectInsertedCount, BucketedSequenceWriter writer,
+				ObjectIndexPipeline pipeline, ObjectIndexBatch directBatch) {
+			this.owner = owner;
+			this.objectStart = objectStart;
+			this.objectInsertedCount = objectInsertedCount;
+			this.writer = writer;
+			this.pipeline = pipeline;
+			this.directBatch = directBatch;
+			int capacity = Math.max(1, depth);
+			freeBatches = new ArrayBlockingQueue<>(capacity);
+			readyBatches = new ArrayBlockingQueue<>(capacity);
+			for (int i = 0; i < capacity; i++) {
+				freeBatches.add(new ObjectIndexEntryBatch(batchSize));
+			}
+			poison = new ObjectIndexEntryBatch(0);
+			error = new AtomicReference<>();
+			scratch = new ObjectIndexBatchScratch(batchSize);
+			fillPool = parallelism > 1 ? new ForkJoinPool(parallelism) : null;
+			worker = new Thread(this::run, "BitmapTriples-object-index-batch");
+			worker.setDaemon(true);
+			worker.start();
+		}
+
+		private void run() {
+			try {
+				while (true) {
+					ObjectIndexEntryBatch batch = take(readyBatches);
+					if (batch == poison) {
+						return;
+					}
+					owner.writeObjectIndexBatch(batch.entries, batch.length, objectStart, objectInsertedCount, writer,
+							pipeline, directBatch, scratch, fillPool);
+					batch.length = 0;
+					put(freeBatches, batch);
+				}
+			} catch (Throwable t) {
+				error.set(t);
+			}
+		}
+
+		private ObjectIndexEntryBatch acquire() {
+			checkError();
+			return take(freeBatches);
+		}
+
+		private void submit(ObjectIndexEntryBatch batch) {
+			checkError();
+			put(readyBatches, batch);
+		}
+
+		@Override
+		public void close() {
+			put(readyBatches, poison);
+			try {
+				worker.join();
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
+			if (fillPool != null) {
+				fillPool.shutdown();
+			}
+			checkError();
+		}
+
+		private void checkError() {
+			Throwable t = error.get();
+			if (t != null) {
+				throw new RuntimeException(t);
+			}
+		}
+
+		private static ObjectIndexEntryBatch take(BlockingQueue<ObjectIndexEntryBatch> queue) {
+			while (true) {
+				try {
+					ObjectIndexEntryBatch batch = queue.poll(QUEUE_WAIT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+					if (batch != null) {
+						return batch;
+					}
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+					throw new RuntimeException(e);
+				}
+			}
+		}
+
+		private static void put(BlockingQueue<ObjectIndexEntryBatch> queue, ObjectIndexEntryBatch batch) {
+			while (true) {
+				try {
+					if (queue.offer(batch, QUEUE_WAIT_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+						return;
+					}
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+					throw new RuntimeException(e);
+				}
+			}
 		}
 	}
 

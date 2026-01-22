@@ -33,10 +33,15 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.ForkJoinTask;
 
 final class BucketedSequenceWriter implements Closeable {
 	private static final int OBJECT_INDEX_BUCKET_SIZE = 1 << 20;
@@ -45,6 +50,19 @@ final class BucketedSequenceWriter implements Closeable {
 	private static final int OBJECT_INDEX_RECORD_BYTES = Integer.BYTES + Long.BYTES;
 	private static final int OBJECT_INDEX_CHUNK_HEADER_BYTES = Integer.BYTES + Integer.BYTES;
 	private static final long OBJECT_INDEX_MISSING = -1L;
+	private static final int PARALLEL_WRITE_MIN_BUCKETS = 2;
+	private static final int PARALLEL_WRITE_MIN_RECORDS = 1 << 14;
+	private static final LZ4Factory LZ4_FACTORY = LZ4Factory.fastestInstance();
+	private static final ThreadLocal<WriteBuffers> WRITE_BUFFERS = ThreadLocal.withInitial(WriteBuffers::new);
+	private static volatile BucketWriteObserver bucketWriteObserver;
+
+	interface BucketWriteObserver {
+		void onBucketWrite(int bucket, String threadName);
+	}
+
+	static void setBucketWriteObserver(BucketWriteObserver observer) {
+		bucketWriteObserver = observer;
+	}
 
 	private final CloseSuppressPath root;
 	private final long totalEntries;
@@ -66,6 +84,7 @@ final class BucketedSequenceWriter implements Closeable {
 	private final byte[] chunkHeader;
 	private final LZ4Compressor compressor;
 	private final LZ4FastDecompressor decompressor;
+	private int writeParallelism = 1;
 
 	BucketedSequenceWriter(CloseSuppressPath root, long totalEntries, int bucketSize, int bufferRecords) {
 		if (totalEntries < 0) {
@@ -96,9 +115,8 @@ final class BucketedSequenceWriter implements Closeable {
 		sortedOffsets = new int[bufferRecords];
 		sortedValues = new long[bufferRecords];
 
-		LZ4Factory factory = LZ4Factory.fastestInstance();
-		compressor = factory.fastCompressor();
-		decompressor = factory.fastDecompressor();
+		compressor = LZ4_FACTORY.fastCompressor();
+		decompressor = LZ4_FACTORY.fastDecompressor();
 		ioBuffer = new byte[OBJECT_INDEX_IO_BUFFER_BYTES];
 		compressedBuffer = new byte[compressor.maxCompressedLength(OBJECT_INDEX_IO_BUFFER_BYTES)];
 		chunkHeader = new byte[OBJECT_INDEX_CHUNK_HEADER_BYTES];
@@ -135,6 +153,13 @@ final class BucketedSequenceWriter implements Closeable {
 			return Integer.MAX_VALUE;
 		}
 		return (int) records;
+	}
+
+	void setWriteParallelism(int parallelism) {
+		if (parallelism < 1 || parallelism >= Integer.MAX_VALUE - 5) {
+			throw new IllegalArgumentException("parallelism must be positive: " + parallelism);
+		}
+		this.writeParallelism = parallelism;
 	}
 
 	void add(long index, long value) {
@@ -213,16 +238,20 @@ final class BucketedSequenceWriter implements Closeable {
 			sortedValues[outIndex] = valueBuffer[i];
 		}
 
-		for (int bucket = 0; bucket < bucketCount; bucket++) {
-			int start = bucketOffsets[bucket];
-			int end = bucketOffsets[bucket + 1];
-			if (start == end) {
-				continue;
-			}
-			CloseSuppressPath file = root.resolve(bucketFileName(bucket));
-			try (OutputStream out = new BufferedOutputStream(Files.newOutputStream(file, StandardOpenOption.CREATE,
-					StandardOpenOption.WRITE, StandardOpenOption.APPEND))) {
-				writeRecords(out, sortedOffsets, sortedValues, start, end);
+		if (shouldWriteInParallel()) {
+			writeBucketsParallel();
+		} else {
+			for (int bucket = 0; bucket < bucketCount; bucket++) {
+				int start = bucketOffsets[bucket];
+				int end = bucketOffsets[bucket + 1];
+				if (start == end) {
+					continue;
+				}
+				CloseSuppressPath file = root.resolve(bucketFileName(bucket));
+				try (OutputStream out = new BufferedOutputStream(Files.newOutputStream(file, StandardOpenOption.CREATE,
+						StandardOpenOption.WRITE, StandardOpenOption.APPEND))) {
+					writeRecords(out, sortedOffsets, sortedValues, start, end);
+				}
 			}
 		}
 
@@ -295,6 +324,25 @@ final class BucketedSequenceWriter implements Closeable {
 		}
 	}
 
+	private void writeRecords(OutputStream out, int[] offsets, long[] values, int from, int to, WriteBuffers buffers)
+			throws IOException {
+		byte[] buffer = buffers.ioBuffer;
+		int pos = 0;
+		for (int i = from; i < to; i++) {
+			if (buffer.length - pos < OBJECT_INDEX_RECORD_BYTES) {
+				writeChunk(out, buffer, pos, buffers);
+				pos = 0;
+			}
+			putInt(buffer, pos, offsets[i]);
+			pos += Integer.BYTES;
+			putLong(buffer, pos, values[i]);
+			pos += Long.BYTES;
+		}
+		if (pos > 0) {
+			writeChunk(out, buffer, pos, buffers);
+		}
+	}
+
 	private void readRecords(InputStream in, long[] valuesByOffset) throws IOException {
 		byte[] header = chunkHeader;
 		byte[] buffer = ioBuffer;
@@ -350,6 +398,15 @@ final class BucketedSequenceWriter implements Closeable {
 		out.write(compressedBuffer, 0, compressedLength);
 	}
 
+	private void writeChunk(OutputStream out, byte[] buffer, int length, WriteBuffers buffers) throws IOException {
+		int compressedLength = buffers.compressor.compress(buffer, 0, length, buffers.compressedBuffer, 0,
+				buffers.compressedBuffer.length);
+		putInt(buffers.chunkHeader, 0, length);
+		putInt(buffers.chunkHeader, Integer.BYTES, compressedLength);
+		out.write(buffers.chunkHeader, 0, OBJECT_INDEX_CHUNK_HEADER_BYTES);
+		out.write(buffers.compressedBuffer, 0, compressedLength);
+	}
+
 	private static int readFully(InputStream in, byte[] buffer, int offset, int length) throws IOException {
 		int total = 0;
 		while (total < length) {
@@ -395,6 +452,80 @@ final class BucketedSequenceWriter implements Closeable {
 	@Override
 	public void close() throws IOException {
 		root.close();
+	}
+
+	private boolean shouldWriteInParallel() {
+		return writeParallelism > 1 && bucketCount >= PARALLEL_WRITE_MIN_BUCKETS && size >= PARALLEL_WRITE_MIN_RECORDS;
+	}
+
+	private void writeBucketsParallel() throws IOException {
+		ForkJoinPool pool = new ForkJoinPool(writeParallelism);
+		List<ForkJoinTask<?>> tasks = new ArrayList<>();
+		try {
+			int taskCount = Math.min(bucketCount, Math.max(1, writeParallelism * 4));
+			int chunkSize = (bucketCount + taskCount - 1) / taskCount;
+			for (int task = 0; task < taskCount; task++) {
+				int start = task * chunkSize;
+				int end = Math.min(bucketCount, start + chunkSize);
+				if (start >= end) {
+					break;
+				}
+				tasks.add(pool.submit(() -> writeBucketRange(start, end)));
+			}
+
+			for (ForkJoinTask<?> task : tasks) {
+				try {
+					task.join();
+				} catch (RuntimeException e) {
+					Throwable cause = e.getCause();
+					if (cause instanceof UncheckedIOException uio) {
+						throw uio.getCause();
+					}
+					throw e;
+				}
+			}
+		} finally {
+			pool.shutdown();
+		}
+	}
+
+	private void writeBucketRange(int startBucket, int endBucket) {
+		for (int bucket = startBucket; bucket < endBucket; bucket++) {
+			int start = bucketOffsets[bucket];
+			int end = bucketOffsets[bucket + 1];
+			if (start == end) {
+				continue;
+			}
+			notifyBucketWrite(bucket);
+			CloseSuppressPath file = root.resolve(bucketFileName(bucket));
+			try (OutputStream out = new BufferedOutputStream(Files.newOutputStream(file, StandardOpenOption.CREATE,
+					StandardOpenOption.WRITE, StandardOpenOption.APPEND), OBJECT_INDEX_IO_BUFFER_BYTES)) {
+				writeRecords(out, sortedOffsets, sortedValues, start, end, WRITE_BUFFERS.get());
+			} catch (IOException e) {
+				throw new UncheckedIOException(e);
+			}
+		}
+	}
+
+	private static void notifyBucketWrite(int bucket) {
+		BucketWriteObserver observer = bucketWriteObserver;
+		if (observer != null) {
+			observer.onBucketWrite(bucket, Thread.currentThread().getName());
+		}
+	}
+
+	private static final class WriteBuffers {
+		private final byte[] ioBuffer;
+		private final byte[] compressedBuffer;
+		private final byte[] chunkHeader;
+		private final LZ4Compressor compressor;
+
+		private WriteBuffers() {
+			compressor = LZ4_FACTORY.fastCompressor();
+			ioBuffer = new byte[OBJECT_INDEX_IO_BUFFER_BYTES];
+			compressedBuffer = new byte[compressor.maxCompressedLength(OBJECT_INDEX_IO_BUFFER_BYTES)];
+			chunkHeader = new byte[OBJECT_INDEX_CHUNK_HEADER_BYTES];
+		}
 	}
 
 	private static String bucketFileName(int bucket) {

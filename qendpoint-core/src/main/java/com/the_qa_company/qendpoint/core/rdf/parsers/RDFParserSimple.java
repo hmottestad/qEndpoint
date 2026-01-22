@@ -190,7 +190,7 @@ public class RDFParserSimple implements RDFParserCallback {
 		if (literal == null || literal.length() == 0 || literal.charAt(0) != '"') {
 			return literal;
 		}
-		int marker = indexOfToken(literal, "^^<");
+		int marker = datatypeMarkerIndex(literal);
 		if (marker == -1) {
 			return literal;
 		}
@@ -219,7 +219,7 @@ public class RDFParserSimple implements RDFParserCallback {
 		if (literal == null || literal.length() == 0 || literal.charAt(0) != '"') {
 			return;
 		}
-		int marker = indexOfToken(literal, "^^<");
+		int marker = datatypeMarkerIndex(literal);
 		if (marker == -1) {
 			return;
 		}
@@ -245,17 +245,37 @@ public class RDFParserSimple implements RDFParserCallback {
 		return !(first == '_' && value.length() > 1 && value.charAt(1) == ':');
 	}
 
-	private static int indexOfToken(CharSequence value, String token) {
-		int limit = value.length() - token.length();
-		for (int i = 0; i <= limit; i++) {
-			boolean matches = true;
-			for (int j = 0; j < token.length(); j++) {
-				if (value.charAt(i + j) != token.charAt(j)) {
-					matches = false;
-					break;
-				}
+	private static int datatypeMarkerIndex(CharSequence literal) {
+		int closingQuote = closingQuoteIndex(literal);
+		if (closingQuote == -1) {
+			return -1;
+		}
+		int marker = closingQuote + 1;
+		if (marker + 2 >= literal.length()) {
+			return -1;
+		}
+		if (literal.charAt(marker) == '^' && literal.charAt(marker + 1) == '^' && literal.charAt(marker + 2) == '<') {
+			return marker;
+		}
+		return -1;
+	}
+
+	private static int closingQuoteIndex(CharSequence literal) {
+		if (literal == null || literal.length() < 2 || literal.charAt(0) != '"') {
+			return -1;
+		}
+		boolean escaped = false;
+		for (int i = 1; i < literal.length(); i++) {
+			char c = literal.charAt(i);
+			if (escaped) {
+				escaped = false;
+				continue;
 			}
-			if (matches) {
+			if (c == '\\') {
+				escaped = true;
+				continue;
+			}
+			if (c == '"') {
 				return i;
 			}
 		}

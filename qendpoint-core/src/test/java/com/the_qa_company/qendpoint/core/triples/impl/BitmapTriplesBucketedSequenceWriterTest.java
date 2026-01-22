@@ -9,10 +9,14 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 import java.io.InputStream;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
 
 import static org.junit.Assert.assertEquals;
@@ -119,6 +123,54 @@ public class BitmapTriplesBucketedSequenceWriterTest {
 				writer.close();
 			}
 		}
+	}
+
+	@Test
+	public void parallelBucketWritesAvoidCommonPool() throws Exception {
+		long totalEntries = 20_000L;
+		int bucketSize = 1024;
+		int bufferRecords = 20_000;
+
+		Class<?> observerType = Class
+				.forName("com.the_qa_company.qendpoint.core.triples.impl.BucketedSequenceWriter$BucketWriteObserver");
+		Method setter = BucketedSequenceWriter.class.getDeclaredMethod("setBucketWriteObserver", observerType);
+		setter.setAccessible(true);
+
+		Set<String> threads = ConcurrentHashMap.newKeySet();
+		Object observer = Proxy.newProxyInstance(observerType.getClassLoader(), new Class[] { observerType },
+				(proxy, method, args) -> {
+					threads.add((String) args[1]);
+					return null;
+				});
+
+		try (CloseSuppressPath root = CloseSuppressPath.of(tempDir.newFolder().toPath())) {
+			root.closeWithDeleteRecurse();
+
+			BucketedSequenceWriter writer = new BucketedSequenceWriter(root, totalEntries, bucketSize, bufferRecords);
+			try {
+				writer.setWriteParallelism(4);
+				setter.invoke(null, observer);
+
+				long[] indexes = new long[(int) totalEntries];
+				long[] values = new long[(int) totalEntries];
+				for (int i = 0; i < totalEntries; i++) {
+					indexes[i] = i;
+					values[i] = i;
+				}
+				writer.addBatch(indexes, values, indexes.length);
+
+				DynamicSequence sequence = new SequenceLog64(64, totalEntries, true);
+				writer.materializeTo(sequence);
+			} finally {
+				setter.invoke(null, new Object[] { null });
+				writer.close();
+			}
+		}
+
+		assertTrue("parallel writes used fork-join workers",
+				threads.stream().anyMatch(name -> name.startsWith("ForkJoinPool-")));
+		assertTrue("parallel writes avoided common pool",
+				threads.stream().noneMatch(name -> name.contains("commonPool")));
 	}
 
 	private static int readInt(byte[] buffer, int offset) {

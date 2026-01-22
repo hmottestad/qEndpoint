@@ -29,6 +29,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Bucketed mapping sink for disk imports.
@@ -42,6 +45,15 @@ import java.util.concurrent.CompletionException;
 public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeConsumer, Closeable {
 	private static final Logger log = LoggerFactory.getLogger(BucketedTripleMapper.class);
 	private static final int RECORD_BYTES = Integer.BYTES + Long.BYTES;
+	private static volatile MaterializationObserver materializationObserver;
+
+	interface MaterializationObserver {
+		void onMaterialization(String role, String threadName);
+	}
+
+	static void setMaterializationObserver(MaterializationObserver observer) {
+		materializationObserver = observer;
+	}
 
 	private final RoleSpooler subjects;
 	private final RoleSpooler predicates;
@@ -116,11 +128,56 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 	public void materializeTo(CompressTripleMapper mapper, ProgressListener listener) throws IOException {
 		flush();
 		ProgressListener progressListener = ProgressListener.ofNullable(listener);
-		subjects.materialize(Role.SUBJECT, mapper, progressListener);
-		predicates.materialize(Role.PREDICATE, mapper, progressListener);
-		objects.materialize(Role.OBJECT, mapper, progressListener);
-		if (supportsGraph) {
-			graphs.materialize(Role.GRAPH, mapper, progressListener);
+		List<CompletableFuture<Void>> futures = new ArrayList<>();
+		int roleCount = supportsGraph ? 4 : 3;
+		AtomicInteger threadId = new AtomicInteger(1);
+		ExecutorService executor = Executors.newFixedThreadPool(roleCount, runnable -> {
+			Thread thread = new Thread(runnable, "BucketedTripleMapper-materialize-" + threadId.getAndIncrement());
+			thread.setDaemon(true);
+			return thread;
+		});
+
+		try {
+			futures.add(CompletableFuture.runAsync(() -> {
+				try {
+					subjects.materialize(Role.SUBJECT, mapper, progressListener);
+				} catch (IOException e) {
+					throw new CompletionException(e);
+				}
+			}, executor));
+			futures.add(CompletableFuture.runAsync(() -> {
+				try {
+					predicates.materialize(Role.PREDICATE, mapper, progressListener);
+				} catch (IOException e) {
+					throw new CompletionException(e);
+				}
+			}, executor));
+			futures.add(CompletableFuture.runAsync(() -> {
+				try {
+					objects.materialize(Role.OBJECT, mapper, progressListener);
+				} catch (IOException e) {
+					throw new CompletionException(e);
+				}
+			}, executor));
+			if (supportsGraph) {
+				futures.add(CompletableFuture.runAsync(() -> {
+					try {
+						graphs.materialize(Role.GRAPH, mapper, progressListener);
+					} catch (IOException e) {
+						throw new CompletionException(e);
+					}
+				}, executor));
+			}
+
+			CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new)).join();
+		} catch (CompletionException e) {
+			Throwable cause = e.getCause();
+			if (cause instanceof IOException io) {
+				throw io;
+			}
+			throw e;
+		} finally {
+			executor.shutdown();
 		}
 	}
 
@@ -146,6 +203,13 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 
 	private enum Role {
 		SUBJECT, PREDICATE, OBJECT, GRAPH
+	}
+
+	private static void notifyMaterialization(Role role) {
+		MaterializationObserver observer = materializationObserver;
+		if (observer != null) {
+			observer.onMaterialization(role.name(), Thread.currentThread().getName());
+		}
 	}
 
 	private static final class RoleSpooler implements Closeable {
@@ -677,6 +741,7 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 
 		private void materialize(Role role, CompressTripleMapper mapper, ProgressListener listener) throws IOException {
 			ProgressListener progressListener = ProgressListener.ofNullable(listener);
+			notifyMaterialization(role);
 			if (tripleCount == 0) {
 				progressListener.notifyProgress(100, "Materialized " + role + " mapping");
 				return;

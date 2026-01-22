@@ -10,10 +10,13 @@ import org.junit.rules.TemporaryFolder;
 
 import java.io.InputStream;
 import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
 
 import static org.junit.Assert.assertEquals;
@@ -142,6 +145,70 @@ public class BucketedTripleMapperMaterializationTest {
 				close.invoke(bucketed);
 			}
 		}
+	}
+
+	@Test
+	public void materializesRolesInParallelThreads() throws Exception {
+		Class<?> bucketedMapperClass = Class
+				.forName("com.the_qa_company.qendpoint.core.hdt.impl.diskimport.BucketedTripleMapper");
+		Class<?> observerType = Class.forName(
+				"com.the_qa_company.qendpoint.core.hdt.impl.diskimport.BucketedTripleMapper$MaterializationObserver");
+		Method setObserver = bucketedMapperClass.getDeclaredMethod("setMaterializationObserver", observerType);
+		setObserver.setAccessible(true);
+
+		Map<String, String> roleThreads = new ConcurrentHashMap<>();
+		Object observer = Proxy.newProxyInstance(observerType.getClassLoader(), new Class[] { observerType },
+				(proxy, method, args) -> {
+					roleThreads.put((String) args[0], (String) args[1]);
+					return null;
+				});
+
+		try {
+			setObserver.invoke(null, observer);
+
+			try (CloseSuppressPath root = CloseSuppressPath.of(tempDir.newFolder().toPath())) {
+				root.closeWithDeleteRecurse();
+
+				long tripleCount = 100;
+				try (CloseSuppressPath bucketDir = root.resolve("bucketed")) {
+					bucketDir.mkdirs();
+
+					Object bucketed = bucketedMapperClass
+							.getConstructor(CloseSuppressPath.class, long.class, boolean.class, int.class, int.class)
+							.newInstance(bucketDir, tripleCount, false, 8, 64);
+					CompressFourSectionDictionary.NodeConsumer consumer = (CompressFourSectionDictionary.NodeConsumer) bucketed;
+
+					for (long tripleId = 1; tripleId <= tripleCount; tripleId++) {
+						long headerId = CompressUtil.getHeaderId(tripleId);
+						consumer.onSubject(tripleId, headerId);
+						consumer.onPredicate(tripleId, headerId);
+						consumer.onObject(tripleId, headerId);
+					}
+
+					try (CloseSuppressPath mapperDir = root.resolve("mapper")) {
+						mapperDir.mkdirs();
+
+						CompressTripleMapper mapper = new CompressTripleMapper(mapperDir, tripleCount, 1024, false, 0);
+						Method materializeTo = bucketedMapperClass.getMethod("materializeTo",
+								CompressTripleMapper.class);
+						materializeTo.invoke(bucketed, mapper);
+						mapper.delete();
+					}
+
+					Method close = bucketedMapperClass.getMethod("close");
+					close.invoke(bucketed);
+				}
+			}
+		} finally {
+			setObserver.invoke(null, new Object[] { null });
+		}
+
+		assertEquals("subject thread", true, roleThreads.containsKey("SUBJECT"));
+		assertEquals("predicate thread", true, roleThreads.containsKey("PREDICATE"));
+		assertEquals("object thread", true, roleThreads.containsKey("OBJECT"));
+		assertTrue("materialize threads have prefix",
+				roleThreads.values().stream().allMatch(name -> name.startsWith("BucketedTripleMapper-materialize-")));
+		assertTrue("multiple role threads used", roleThreads.values().stream().distinct().count() >= 3);
 	}
 
 	private static int readInt(byte[] buffer, int offset) {
