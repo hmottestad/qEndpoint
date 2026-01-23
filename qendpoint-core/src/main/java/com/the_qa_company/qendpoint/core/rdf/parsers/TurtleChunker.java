@@ -345,12 +345,35 @@ public class TurtleChunker {
 	}
 
 	private void handleAtInDefault(byte b) throws IOException {
-		if (bufPos - chunkStart > 1) {
+		if (!hasOnlyWhitespaceOrComments(chunkStart, bufPos - 1)) {
 			throw new RuntimeException("Unexpected @ in block: "
 					+ new String(chunkBuf, chunkStart, bufPos - chunkStart, StandardCharsets.UTF_8));
-		} else {
-			state = State.PREFIX_OR_BASE;
 		}
+		state = State.PREFIX_OR_BASE;
+	}
+
+	private boolean hasOnlyWhitespaceOrComments(int start, int endExclusive) {
+		int i = start;
+		while (i < endExclusive) {
+			byte current = chunkBuf[i];
+			if (current == '#') {
+				i++;
+				while (i < endExclusive) {
+					byte commentByte = chunkBuf[i];
+					if (commentByte == '\n' || commentByte == '\r') {
+						break;
+					}
+					i++;
+				}
+				continue;
+			}
+			if (current == ' ' || current == '\t' || current == '\n' || current == '\r') {
+				i++;
+				continue;
+			}
+			return false;
+		}
+		return true;
 	}
 
 	private void parsePeriodOneStep() {
