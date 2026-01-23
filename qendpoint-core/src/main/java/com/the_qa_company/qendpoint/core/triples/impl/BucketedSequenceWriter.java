@@ -216,6 +216,9 @@ final class BucketedSequenceWriter implements Closeable {
 	}
 
 	void flush() throws IOException {
+		if(Thread.currentThread().isInterrupted()){
+			throw new RuntimeException("Thread interrupted");
+		}
 		if (size == 0) {
 			return;
 		}
