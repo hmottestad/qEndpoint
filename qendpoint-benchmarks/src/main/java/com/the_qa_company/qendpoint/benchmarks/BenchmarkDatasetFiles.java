@@ -1,5 +1,6 @@
 package com.the_qa_company.qendpoint.benchmarks;
 
+import com.the_qa_company.qendpoint.benchmarks.dataset.ThemeDatasetGenerator;
 import org.apache.jena.riot.Lang;
 import org.apache.jena.riot.RDFParser;
 import org.apache.jena.riot.system.StreamRDF;
@@ -21,6 +22,7 @@ public final class BenchmarkDatasetFiles {
 
 	private static final Path DATAGOVBE_VALID_TTL = Path.of("indexing", "datagovbe-valid.ttl");
 	private static final Path DATAGOVBE_VALID_NT_GZ = Path.of("indexing", "datagovbe-valid.nt.gz");
+	private static final Path THEME_MIXED_NT_GZ = Path.of("indexing", "theme-mixed.nt.gz");
 
 	private BenchmarkDatasetFiles() {
 	}
@@ -31,6 +33,14 @@ public final class BenchmarkDatasetFiles {
 		Path ttlFile = repoRoot.resolve(DATAGOVBE_VALID_TTL);
 		Path ntGzFile = repoRoot.resolve(DATAGOVBE_VALID_NT_GZ);
 		ensureTurtleToNtGz(ttlFile, ntGzFile);
+		return ntGzFile;
+	}
+
+	public static Path ensureThemeMixedNtGz(Path repoRoot) throws IOException {
+		Objects.requireNonNull(repoRoot, "repoRoot");
+
+		Path ntGzFile = repoRoot.resolve(THEME_MIXED_NT_GZ);
+		ensureThemeDatasetNtGz(ntGzFile);
 		return ntGzFile;
 	}
 
@@ -56,6 +66,38 @@ public final class BenchmarkDatasetFiles {
 			StreamRDF writer = StreamRDFWriter.getWriterStream(gzipOut, Lang.NTRIPLES);
 
 			RDFParser.source(ttlFile.toString()).base(ttlFile.toUri().toString()).lang(Lang.TURTLE).parse(writer);
+		} catch (RuntimeException e) {
+			Files.deleteIfExists(tmpFile);
+			throw e;
+		} catch (IOException e) {
+			Files.deleteIfExists(tmpFile);
+			throw e;
+		}
+
+		try {
+			Files.move(tmpFile, ntGzFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+		} catch (AtomicMoveNotSupportedException e) {
+			Files.move(tmpFile, ntGzFile, StandardCopyOption.REPLACE_EXISTING);
+		}
+	}
+
+	static void ensureThemeDatasetNtGz(Path ntGzFile) throws IOException {
+		if (Files.exists(ntGzFile)) {
+			return;
+		}
+
+		Files.createDirectories(ntGzFile.getParent());
+
+		Path tmpFile = ntGzFile.resolveSibling(ntGzFile.getFileName() + ".tmp");
+
+		try (OutputStream fileOut = Files.newOutputStream(tmpFile, StandardOpenOption.CREATE,
+				StandardOpenOption.TRUNCATE_EXISTING);
+				OutputStream bufferedOut = new BufferedOutputStream(fileOut);
+				GZIPOutputStream gzipOut = new GZIPOutputStream(bufferedOut)) {
+
+			ThemeDatasetGenerator.GenerationConfig config = ThemeDatasetGenerator.GenerationConfig
+					.fromSystemProperties();
+			ThemeDatasetGenerator.generate(ThemeDatasetGenerator.Theme.MIXED, config, gzipOut);
 		} catch (RuntimeException e) {
 			Files.deleteIfExists(tmpFile);
 			throw e;

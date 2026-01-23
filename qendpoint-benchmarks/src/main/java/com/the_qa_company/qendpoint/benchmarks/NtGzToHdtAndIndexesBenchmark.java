@@ -122,6 +122,12 @@ public class NtGzToHdtAndIndexesBenchmark {
 						return generated;
 					}
 				}
+				if (input.normalize().equals(Path.of("indexing", "theme-mixed.nt.gz"))) {
+					Path generated = BenchmarkDatasetFiles.ensureThemeMixedNtGz(repoRoot).normalize();
+					if (Files.exists(generated)) {
+						return generated;
+					}
+				}
 			}
 
 			throw new IllegalArgumentException("Input path does not exist: " + pathString + " (cwd=" + cwd
