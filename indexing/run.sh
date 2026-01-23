@@ -28,9 +28,9 @@
 #real    7m29.917s
 #user    30m28.923s
 #sys     1m9.650s
-export JAVA_OPTIONS="-Xms32G -Xmx32G -XX:+UseParallelGC -XX:+AlwaysPreTouch -XX:+DisableExplicitGC"
+#export JAVA_OPTIONS="-Xms32G -Xmx32G -XX:+UseParallelGC -XX:+AlwaysPreTouch -XX:+DisableExplicitGC"
 #export JAVA_OPTIONS="-Xms32G -Xmx32G -XX:+UseParallelGC -XX:+AlwaysPreTouch -XX:+DisableExplicitGC -XX:+UseCompactObjectHeaders"
-time ./qendpoint-cli-2.5.3/bin/rdf2hdt.sh -index -disk -disklocation ./temp/ -multithread /Users/havardottestad/Documents/wikidata/first_500M_lines_truthy.nt.gz first_500M_lines_truthy.hdt
+#time ./qendpoint-cli-2.5.3/bin/rdf2hdt.sh -index -disk -disklocation ./temp/ -multithread /Users/havardottestad/Documents/wikidata/first_500M_lines_truthy.nt.gz first_500M_lines_truthy.hdt
 
 
 #[main] . [##########] 100.0 done
@@ -40,8 +40,8 @@ time ./qendpoint-cli-2.5.3/bin/rdf2hdt.sh -index -disk -disklocation ./temp/ -mu
 #Different objects ..... 3753832879
 #Common Subject/Object . 2056458644
 #
-#real    381m5.685s
-#user    1288m23.132s
-#sys     285m19.233s
-#export JAVA_OPTIONS="-Xms64G -Xmx64G -XX:+UseParallelGC -XX:+AlwaysPreTouch -XX:+DisableExplicitGC -XX:+UseCompactObjectHeaders"
-#time ./qendpoint-cli-2.5.3/bin/rdf2hdt.sh -disk -disklocation ./temp/ -multithread /Users/havardottestad/Documents/wikidata/wikidata-20251208-all-BETA.nt.gz wikidata-20251208-all-BETA.hdt
+#real    354m53.017s
+#user    1272m56.135s
+#sys     303m49.361s
+export JAVA_OPTIONS="-Xms64G -Xmx64G -XX:+UseParallelGC -XX:+AlwaysPreTouch -XX:+DisableExplicitGC -XX:+UseCompactObjectHeaders"
+time ./qendpoint-cli-2.5.3/bin/rdf2hdt.sh -disk -disklocation ./temp/ -multithread /Users/havardottestad/Documents/wikidata/wikidata-20251208-all-BETA.nt.gz wikidata-20251208-all-BETA.hdt
