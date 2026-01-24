@@ -1,15 +1,32 @@
 package com.the_qa_company.qendpoint.core.util.listener;
 
+import java.lang.management.GarbageCollectorMXBean;
+import java.lang.management.ManagementFactory;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.TimeUnit;
+
+import javax.management.Notification;
+import javax.management.NotificationEmitter;
+import javax.management.NotificationListener;
+import javax.management.openmbean.CompositeData;
 
 import com.the_qa_company.qendpoint.core.listener.MultiThreadListener;
 import com.the_qa_company.qendpoint.core.listener.ProgressMessage;
+import com.the_qa_company.qendpoint.core.util.ProfilingUtil;
+import com.sun.management.GarbageCollectionNotificationInfo;
 
 public class MultiThreadListenerConsole implements MultiThreadListener {
 	private static final int BAR_SIZE = 10;
 	private static final String ERASE_LINE = "\r\033[K";
 	private static final long REFRESH_MILLIS = 300;
+	private static final long GC_WINDOW_MILLIS = 60_000L;
+	private static final GcMonitor GC_MONITOR = new GcMonitor();
 
 	private static String goBackNLine(int line) {
 		return "\033[" + line + "A";
@@ -47,11 +64,119 @@ public class MultiThreadListenerConsole implements MultiThreadListener {
 
 	private final Map<String, ThreadState> threadMessages;
 	private final boolean color;
+	private final long startNanos;
 	private int previous;
 
 	private static final class ThreadState {
 		private float level;
 		private ProgressMessage message;
+	}
+
+	private static final class MemorySnapshot {
+		private final long used;
+		private final long left;
+
+		private MemorySnapshot(long used, long left) {
+			this.used = used;
+			this.left = left;
+		}
+
+		private static MemorySnapshot capture() {
+			Runtime runtime = Runtime.getRuntime();
+			long used = runtime.totalMemory() - runtime.freeMemory();
+			long left = Math.max(0L, runtime.maxMemory() - used);
+			return new MemorySnapshot(used, left);
+		}
+
+		private String format() {
+			return ProfilingUtil.tidyFileSize(used) + "/" + ProfilingUtil.tidyFileSize(left);
+		}
+	}
+
+	private static final class GcSample {
+		private final long timestampMillis;
+		private final long durationMillis;
+
+		private GcSample(long timestampMillis, long durationMillis) {
+			this.timestampMillis = timestampMillis;
+			this.durationMillis = durationMillis;
+		}
+	}
+
+	private static final class GcMonitor {
+		private final Deque<GcSample> samples = new ArrayDeque<>();
+		private final List<NotificationEmitter> emitters = new ArrayList<>();
+		private final NotificationListener listener = this::handleNotification;
+		private final boolean supported;
+
+		private GcMonitor() {
+			supported = register();
+		}
+
+		private boolean register() {
+			boolean registered = false;
+			for (GarbageCollectorMXBean bean : ManagementFactory.getGarbageCollectorMXBeans()) {
+				if (!(bean instanceof NotificationEmitter)) {
+					continue;
+				}
+				try {
+					NotificationEmitter emitter = (NotificationEmitter) bean;
+					emitter.addNotificationListener(listener, null, null);
+					emitters.add(emitter);
+					registered = true;
+				} catch (RuntimeException ex) {
+					// Ignore listener registration failures.
+				}
+			}
+			return registered;
+		}
+
+		private void handleNotification(Notification notification, Object handback) {
+			if (!GarbageCollectionNotificationInfo.GARBAGE_COLLECTION_NOTIFICATION.equals(notification.getType())) {
+				return;
+			}
+			Object data = notification.getUserData();
+			if (!(data instanceof CompositeData)) {
+				return;
+			}
+			try {
+				GarbageCollectionNotificationInfo info = GarbageCollectionNotificationInfo.from((CompositeData) data);
+				record(info.getGcInfo().getDuration());
+			} catch (RuntimeException ex) {
+				// Ignore malformed notifications.
+			}
+		}
+
+		private void record(long durationMillis) {
+			long now = System.currentTimeMillis();
+			synchronized (samples) {
+				samples.addLast(new GcSample(now, durationMillis));
+				trim(now);
+			}
+		}
+
+		private void trim(long now) {
+			long cutoff = now - GC_WINDOW_MILLIS;
+			while (!samples.isEmpty() && samples.peekFirst().timestampMillis < cutoff) {
+				samples.removeFirst();
+			}
+		}
+
+		private String formatPercentLastMinute() {
+			if (!supported) {
+				return "n/a";
+			}
+			long now = System.currentTimeMillis();
+			long total = 0L;
+			synchronized (samples) {
+				trim(now);
+				for (GcSample sample : samples) {
+					total += sample.durationMillis;
+				}
+			}
+			double percent = Math.min(100.0, (total * 100.0) / GC_WINDOW_MILLIS);
+			return String.format(Locale.ROOT, "%.2f%%", percent);
+		}
 	}
 
 	public MultiThreadListenerConsole(boolean color) {
@@ -61,6 +186,7 @@ public class MultiThreadListenerConsole implements MultiThreadListener {
 	public MultiThreadListenerConsole(boolean color, boolean asciiListener) {
 		this.color = color || ALLOW_COLOR_SEQUENCE;
 		threadMessages = new TreeMap<>();
+		startNanos = System.nanoTime();
 		startRenderThread();
 	}
 
@@ -201,7 +327,7 @@ public class MultiThreadListenerConsole implements MultiThreadListener {
 			return;
 		}
 		StringBuilder message = new StringBuilder();
-		int lines = threadMessages.size();
+		int lines = threadMessages.size() + 1;
 		message.append("\r");
 		if (previous != 0) {
 			for (int i = 0; i < previous; i++) {
@@ -218,6 +344,7 @@ public class MultiThreadListenerConsole implements MultiThreadListener {
 				.append(colorThread()).append(thread).append(colorReset()).append("]").append(" ")
 				.append(".".repeat(maxThreadNameSize - thread.length())).append(" ").append(renderState(state))
 				.append("\n"));
+		message.append(renderStatsLine()).append("\n");
 		int toRemove = previous - lines;
 		if (toRemove > 0) {
 			message.append((ERASE_LINE + "\n").repeat(toRemove)).append(goBackNLine(toRemove));
@@ -231,5 +358,22 @@ public class MultiThreadListenerConsole implements MultiThreadListener {
 	private String renderState(ThreadState state) {
 		String message = state.message == null ? "" : state.message.render();
 		return colorReset() + progressBar(state.level) + colorReset() + " " + message;
+	}
+
+	private String renderStatsLine() {
+		MemorySnapshot memory = MemorySnapshot.capture();
+		String gcPercent = GC_MONITOR.formatPercentLastMinute();
+		String uptime = formatUptime();
+		return colorReset() + "[" + colorThread() + "stats" + colorReset() + "] mem used/left: " + memory.format()
+				+ " | gc 60s: " + gcPercent + " | up: " + uptime;
+	}
+
+	private String formatUptime() {
+		long elapsedNanos = System.nanoTime() - startNanos;
+		long elapsedSeconds = TimeUnit.NANOSECONDS.toSeconds(elapsedNanos);
+		long hours = elapsedSeconds / 3600;
+		long minutes = (elapsedSeconds % 3600) / 60;
+		long seconds = elapsedSeconds % 60;
+		return String.format(Locale.ROOT, "%02d:%02d:%02d", hours, minutes, seconds);
 	}
 }

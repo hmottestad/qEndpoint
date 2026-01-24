@@ -3,9 +3,10 @@ package com.the_qa_company.qendpoint.core.hdt.impl.diskimport;
 import com.the_qa_company.qendpoint.core.dictionary.impl.CompressFourSectionDictionary;
 import com.the_qa_company.qendpoint.core.listener.ProgressListener;
 import com.the_qa_company.qendpoint.core.util.io.CloseSuppressPath;
-import net.jpountz.lz4.LZ4Compressor;
-import net.jpountz.lz4.LZ4Factory;
-import net.jpountz.lz4.LZ4FastDecompressor;
+import com.the_qa_company.qendpoint.core.util.io.Lz4Config;
+import io.airlift.compress.v3.MalformedInputException;
+import io.airlift.compress.v3.lz4.Lz4Compressor;
+import io.airlift.compress.v3.lz4.Lz4Decompressor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -263,11 +264,12 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 		private final byte[] compressedBuffer;
 		private final byte[] chunkHeader;
 
-		private final LZ4Compressor compressor;
-		private final LZ4FastDecompressor decompressor;
+		private final Lz4Compressor compressor;
+		private final Lz4Decompressor decompressor;
 
 		private final ChannelCache channelCache;
 		private final ByteBufferPool writeBufferPool;
+		private final boolean compressionEnabled;
 
 		// Reused per-flush lists to reduce allocation churn
 		private final ArrayList<BucketChannel> inFlightBuckets = new ArrayList<>(MAX_IN_FLIGHT_BUCKETS);
@@ -301,9 +303,8 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 			sortedOffsets = new int[bufferSize];
 			sortedHeaders = new long[bufferSize];
 
-			LZ4Factory factory = LZ4Factory.fastestInstance();
-			compressor = factory.fastCompressor();
-			decompressor = factory.fastDecompressor();
+			compressor = Lz4Compressor.create();
+			decompressor = Lz4Decompressor.create();
 
 			ioBuffer = new byte[IO_BUFFER_BYTES];
 			compressedBuffer = new byte[compressor.maxCompressedLength(IO_BUFFER_BYTES)];
@@ -312,6 +313,7 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 			channelCache = new ChannelCache(Math.min(MAX_CACHED_CHANNELS, bucketCount));
 			writeBufferPool = new ByteBufferPool(WRITE_BUF_ROUNDING, WRITE_BUF_POOL_MAX_BYTES,
 					WRITE_BUF_POOL_MAX_PER_SIZE, WRITE_BUF_POOL_MAX_BUFFER_BYTES);
+			compressionEnabled = Lz4Config.ENABLED;
 		}
 
 		private void add(long tripleId, long headerId) {
@@ -437,8 +439,8 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 				return CompletableFuture.completedFuture(null);
 			}
 
-			int maxCompressed = compressor.maxCompressedLength(length);
-			int minCapacity = CHUNK_HEADER_BYTES + maxCompressed;
+			int payloadCapacity = compressionEnabled ? compressor.maxCompressedLength(length) : length;
+			int minCapacity = CHUNK_HEADER_BYTES + payloadCapacity;
 
 			ByteBuffer out = writeBufferPool.acquire(minCapacity);
 			if (!out.hasArray()) {
@@ -450,14 +452,23 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 			byte[] outArray = out.array();
 			int base = out.arrayOffset(); // typically 0
 
-			int compressedLength = compressor.compress(uncompressed, 0, length, outArray, base + CHUNK_HEADER_BYTES,
-					outArray.length - (base + CHUNK_HEADER_BYTES));
+			int compressedLength;
+			int payloadLength;
+			if (compressionEnabled) {
+				compressedLength = compressor.compress(uncompressed, 0, length, outArray, base + CHUNK_HEADER_BYTES,
+						outArray.length - (base + CHUNK_HEADER_BYTES));
+				payloadLength = compressedLength;
+			} else {
+				System.arraycopy(uncompressed, 0, outArray, base + CHUNK_HEADER_BYTES, length);
+				compressedLength = -length;
+				payloadLength = length;
+			}
 
 			// header (big-endian ints, matches existing on-disk format)
 			putInt(outArray, base, length);
 			putInt(outArray, base + Integer.BYTES, compressedLength);
 
-			int totalLen = CHUNK_HEADER_BYTES + compressedLength;
+			int totalLen = CHUNK_HEADER_BYTES + payloadLength;
 
 			out.clear();
 			out.limit(totalLen);
@@ -806,25 +817,49 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 				}
 				int uncompressedLength = getInt(header, 0);
 				int compressedLength = getInt(header, Integer.BYTES);
-				if (uncompressedLength <= 0 || compressedLength <= 0) {
+				int payloadLength = compressedLength > 0 ? compressedLength : -compressedLength;
+				if (uncompressedLength <= 0 || payloadLength <= 0) {
 					throw new EOFException("Unexpected chunk lengths: uncompressed=" + uncompressedLength
 							+ " compressed=" + compressedLength);
 				}
 				if (uncompressedLength > buffer.length) {
 					throw new IOException("Chunk too large: " + uncompressedLength + " > " + buffer.length);
 				}
-				if (compressedLength > compressed.length) {
+				if (compressedLength > 0 && compressedLength > compressed.length) {
 					throw new IOException(
 							"Compressed chunk too large: " + compressedLength + " > " + compressed.length);
 				}
-				int read = readFully(in, compressed, 0, compressedLength);
-				if (read < compressedLength) {
-					throw new EOFException("Unexpected end of compressed chunk: " + read + " < " + compressedLength);
+				if (compressedLength < 0 && payloadLength != uncompressedLength) {
+					throw new EOFException(
+							"Unexpected raw chunk length: " + payloadLength + " != " + uncompressedLength);
+				}
+				int read;
+				if (compressedLength > 0) {
+					read = readFully(in, compressed, 0, payloadLength);
+					if (read < payloadLength) {
+						throw new EOFException("Unexpected end of compressed chunk: " + read + " < " + payloadLength);
+					}
+				} else {
+					read = readFully(in, buffer, 0, payloadLength);
+					if (read < payloadLength) {
+						throw new EOFException("Unexpected end of raw chunk: " + read + " < " + payloadLength);
+					}
 				}
 				if (uncompressedLength % RECORD_BYTES != 0) {
 					throw new EOFException("Unexpected uncompressed chunk length: " + uncompressedLength);
 				}
-				decompressor.decompress(compressed, 0, buffer, 0, uncompressedLength);
+				if (compressedLength > 0) {
+					try {
+						int decompressed = decompressor.decompress(compressed, 0, payloadLength, buffer, 0,
+								uncompressedLength);
+						if (decompressed != uncompressedLength) {
+							throw new IOException(
+									"Unexpected decompressed length: " + decompressed + " != " + uncompressedLength);
+						}
+					} catch (MalformedInputException e) {
+						throw new IOException("Corrupt LZ4 chunk", e);
+					}
+				}
 				for (int pos = 0; pos < uncompressedLength; pos += RECORD_BYTES) {
 					int offset = getInt(buffer, pos);
 					long headerId = getLong(buffer, pos + Integer.BYTES);

@@ -22,39 +22,50 @@ package com.the_qa_company.qendpoint.core.triples.impl;
 import com.the_qa_company.qendpoint.core.compact.sequence.DynamicSequence;
 import com.the_qa_company.qendpoint.core.listener.ProgressListener;
 import com.the_qa_company.qendpoint.core.util.io.CloseSuppressPath;
-import net.jpountz.lz4.LZ4Compressor;
-import net.jpountz.lz4.LZ4Factory;
-import net.jpountz.lz4.LZ4FastDecompressor;
+import com.the_qa_company.qendpoint.core.util.io.Lz4Config;
+import io.airlift.compress.v3.MalformedInputException;
+import io.airlift.compress.v3.lz4.Lz4Compressor;
+import io.airlift.compress.v3.lz4.Lz4Decompressor;
 
 import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
 import java.io.Closeable;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ForkJoinTask;
 
 final class BucketedSequenceWriter implements Closeable {
-	private static final int OBJECT_INDEX_BUCKET_SIZE = 1 << 20;
-	private static final int OBJECT_INDEX_BUFFER_RECORDS = 1 << 20;
+	private static final int OBJECT_INDEX_BUCKET_SIZE = 64 * 1024 * 1024;
+	private static final int OBJECT_INDEX_BUFFER_RECORDS = 1024 * 1024;
 	private static final int OBJECT_INDEX_IO_BUFFER_BYTES = 1024 * 1024;
 	private static final int OBJECT_INDEX_RECORD_BYTES = Integer.BYTES + Long.BYTES;
 	private static final int OBJECT_INDEX_CHUNK_HEADER_BYTES = Integer.BYTES + Integer.BYTES;
 	private static final long OBJECT_INDEX_MISSING = -1L;
 	private static final int PARALLEL_WRITE_MIN_BUCKETS = 2;
 	private static final int PARALLEL_WRITE_MIN_RECORDS = 1 << 14;
-	private static final LZ4Factory LZ4_FACTORY = LZ4Factory.fastestInstance();
+	private static final int MAX_CACHED_CHANNELS = 512;
+	private static final int WRITE_BUF_ROUNDING = 4 * 1024;
+	private static final int WRITE_BUF_POOL_MAX_BYTES = 256 * 1024 * 1024;
+	private static final int WRITE_BUF_POOL_MAX_PER_SIZE = 8;
+	private static final int WRITE_BUF_POOL_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
+	private static final Lz4Decompressor LZ4_DECOMPRESSOR = Lz4Decompressor.create();
 	private static final ThreadLocal<WriteBuffers> WRITE_BUFFERS = ThreadLocal.withInitial(WriteBuffers::new);
 	private static volatile BucketWriteObserver bucketWriteObserver;
+	private static final int MAX_ACCELERATION = 65537;
 
 	interface BucketWriteObserver {
 		void onBucketWrite(int bucket, String threadName);
@@ -82,8 +93,10 @@ final class BucketedSequenceWriter implements Closeable {
 	private final byte[] ioBuffer;
 	private final byte[] compressedBuffer;
 	private final byte[] chunkHeader;
-	private final LZ4Compressor compressor;
-	private final LZ4FastDecompressor decompressor;
+	private final Lz4Decompressor decompressor;
+	private final ChannelCache channelCache;
+	private final ByteBufferPool writeBufferPool;
+	private final boolean compressionEnabled;
 	private int writeParallelism = 1;
 
 	BucketedSequenceWriter(CloseSuppressPath root, long totalEntries, int bucketSize, int bufferRecords) {
@@ -115,18 +128,22 @@ final class BucketedSequenceWriter implements Closeable {
 		sortedOffsets = new int[bufferRecords];
 		sortedValues = new long[bufferRecords];
 
-		compressor = LZ4_FACTORY.fastCompressor();
-		decompressor = LZ4_FACTORY.fastDecompressor();
+		Lz4Compressor sizeCompressor = Lz4Compressor.create(MAX_ACCELERATION);
+		decompressor = LZ4_DECOMPRESSOR;
 		ioBuffer = new byte[OBJECT_INDEX_IO_BUFFER_BYTES];
-		compressedBuffer = new byte[compressor.maxCompressedLength(OBJECT_INDEX_IO_BUFFER_BYTES)];
+		compressedBuffer = new byte[sizeCompressor.maxCompressedLength(OBJECT_INDEX_IO_BUFFER_BYTES)];
 		chunkHeader = new byte[OBJECT_INDEX_CHUNK_HEADER_BYTES];
+		channelCache = new ChannelCache(MAX_CACHED_CHANNELS);
+		writeBufferPool = new ByteBufferPool(WRITE_BUF_ROUNDING, WRITE_BUF_POOL_MAX_BYTES, WRITE_BUF_POOL_MAX_PER_SIZE,
+				WRITE_BUF_POOL_MAX_BUFFER_BYTES);
+		compressionEnabled = Lz4Config.ENABLED;
 	}
 
 	static BucketedSequenceWriter create(Path baseDir, String prefix, long totalEntries, int bucketSize,
 			int bufferRecords) throws IOException {
 
-		bucketSize = Math.max(bucketSize, 16 * 1024 * 1024);
-		bufferRecords = Math.max(bufferRecords, 1024 * 1024);
+		bucketSize = Math.max(bucketSize, OBJECT_INDEX_BUCKET_SIZE);
+		bufferRecords = Math.max(bufferRecords, OBJECT_INDEX_BUFFER_RECORDS);
 
 		Path rootPath;
 		if (baseDir == null) {
@@ -140,7 +157,7 @@ final class BucketedSequenceWriter implements Closeable {
 	}
 
 	static int resolveObjectIndexBucketSize(long totalEntries) {
-		long bucketSize = Math.max(1, Math.min(totalEntries, OBJECT_INDEX_BUCKET_SIZE));
+		long bucketSize = Math.max(OBJECT_INDEX_BUCKET_SIZE, Math.min(totalEntries, (long) OBJECT_INDEX_BUCKET_SIZE));
 		if (bucketSize > Integer.MAX_VALUE) {
 			return Integer.MAX_VALUE;
 		}
@@ -148,7 +165,8 @@ final class BucketedSequenceWriter implements Closeable {
 	}
 
 	static int resolveObjectIndexBufferRecords(long totalEntries, int bucketSize) {
-		long records = Math.max(1, Math.min(totalEntries, Math.min(bucketSize, OBJECT_INDEX_BUFFER_RECORDS)));
+		long records = Math.max(OBJECT_INDEX_BUFFER_RECORDS,
+				Math.min(totalEntries, Math.min((long) bucketSize, OBJECT_INDEX_BUFFER_RECORDS)));
 		if (records > Integer.MAX_VALUE) {
 			return Integer.MAX_VALUE;
 		}
@@ -216,7 +234,7 @@ final class BucketedSequenceWriter implements Closeable {
 	}
 
 	void flush() throws IOException {
-		if(Thread.currentThread().isInterrupted()){
+		if (Thread.currentThread().isInterrupted()) {
 			throw new RuntimeException("Thread interrupted");
 		}
 		if (size == 0) {
@@ -244,6 +262,7 @@ final class BucketedSequenceWriter implements Closeable {
 		if (shouldWriteInParallel()) {
 			writeBucketsParallel();
 		} else {
+			WriteBuffers buffers = WRITE_BUFFERS.get();
 			for (int bucket = 0; bucket < bucketCount; bucket++) {
 				int start = bucketOffsets[bucket];
 				int end = bucketOffsets[bucket + 1];
@@ -251,9 +270,14 @@ final class BucketedSequenceWriter implements Closeable {
 					continue;
 				}
 				CloseSuppressPath file = root.resolve(bucketFileName(bucket));
-				try (OutputStream out = new BufferedOutputStream(Files.newOutputStream(file, StandardOpenOption.CREATE,
-						StandardOpenOption.WRITE, StandardOpenOption.APPEND))) {
-					writeRecords(out, sortedOffsets, sortedValues, start, end);
+				CachedChannel channel = null;
+				try {
+					channel = channelCache.acquire(bucket, file);
+					writeRecords(channel, sortedOffsets, sortedValues, start, end, buffers);
+					channelCache.release(bucket, channel);
+				} catch (IOException e) {
+					ChannelCache.closeQuietly(channel);
+					throw e;
 				}
 			}
 		}
@@ -309,31 +333,60 @@ final class BucketedSequenceWriter implements Closeable {
 		progressListener.notifyProgress(100, "Materialized object index");
 	}
 
-	private void writeRecords(OutputStream out, int[] offsets, long[] values, int from, int to) throws IOException {
-		byte[] buffer = ioBuffer;
-		int pos = 0;
-		for (int i = from; i < to; i++) {
-			if (buffer.length - pos < OBJECT_INDEX_RECORD_BYTES) {
-				writeChunk(out, buffer, pos);
-				pos = 0;
+	long materializeCountsTo(DynamicSequence sequence, long entries, ProgressListener listener) throws IOException {
+		ProgressListener progressListener = ProgressListener.ofNullable(listener);
+		flush();
+		long maxEntries = Math.max(0L, Math.min(entries, totalEntries));
+		if (maxEntries == 0) {
+			progressListener.notifyProgress(100, "Materialized object counts");
+			return 0L;
+		}
+		long processed = 0;
+		int lastPercent = 0;
+		long maxCount = 0;
+		for (int bucket = 0; bucket < bucketCount; bucket++) {
+			long bucketStart = (long) bucket * bucketSize;
+			long remaining = maxEntries - bucketStart;
+			if (remaining <= 0) {
+				break;
 			}
-			putInt(buffer, pos, offsets[i]);
-			pos += Integer.BYTES;
-			putLong(buffer, pos, values[i]);
-			pos += Long.BYTES;
+			int count = (int) Math.min(bucketSize, remaining);
+			long[] values = new long[count];
+			CloseSuppressPath file = root.resolve(bucketFileName(bucket));
+			if (Files.exists(file)) {
+				try (InputStream in = new BufferedInputStream(Files.newInputStream(file),
+						OBJECT_INDEX_IO_BUFFER_BYTES)) {
+					readRecords(in, values, true);
+				}
+			}
+
+			for (int i = 0; i < count; i++) {
+				long value = values[i];
+				if (value != 0) {
+					sequence.set(bucketStart + i, value);
+					if (value > maxCount) {
+						maxCount = value;
+					}
+				}
+			}
+			processed += count;
+			int percent = (int) ((processed * 100d) / maxEntries);
+			if (percent > lastPercent) {
+				progressListener.notifyProgress(percent, "Materializing object counts " + processed + "/" + maxEntries);
+				lastPercent = percent;
+			}
 		}
-		if (pos > 0) {
-			writeChunk(out, buffer, pos);
-		}
+		progressListener.notifyProgress(100, "Materialized object counts");
+		return maxCount;
 	}
 
-	private void writeRecords(OutputStream out, int[] offsets, long[] values, int from, int to, WriteBuffers buffers)
-			throws IOException {
+	private void writeRecords(CachedChannel channel, int[] offsets, long[] values, int from, int to,
+			WriteBuffers buffers) throws IOException {
 		byte[] buffer = buffers.ioBuffer;
 		int pos = 0;
 		for (int i = from; i < to; i++) {
 			if (buffer.length - pos < OBJECT_INDEX_RECORD_BYTES) {
-				writeChunk(out, buffer, pos, buffers);
+				writeChunk(channel, buffer, pos, buffers);
 				pos = 0;
 			}
 			putInt(buffer, pos, offsets[i]);
@@ -342,11 +395,15 @@ final class BucketedSequenceWriter implements Closeable {
 			pos += Long.BYTES;
 		}
 		if (pos > 0) {
-			writeChunk(out, buffer, pos, buffers);
+			writeChunk(channel, buffer, pos, buffers);
 		}
 	}
 
 	private void readRecords(InputStream in, long[] valuesByOffset) throws IOException {
+		readRecords(in, valuesByOffset, false);
+	}
+
+	private void readRecords(InputStream in, long[] valuesByOffset, boolean accumulate) throws IOException {
 		byte[] header = chunkHeader;
 		byte[] buffer = ioBuffer;
 		byte[] compressed = compressedBuffer;
@@ -361,53 +418,112 @@ final class BucketedSequenceWriter implements Closeable {
 			}
 			int uncompressedLength = getInt(header, 0);
 			int compressedLength = getInt(header, Integer.BYTES);
-			if (uncompressedLength <= 0 || compressedLength <= 0) {
+			int payloadLength = compressedLength > 0 ? compressedLength : -compressedLength;
+			if (uncompressedLength <= 0 || payloadLength <= 0) {
 				throw new EOFException("Unexpected chunk lengths: uncompressed=" + uncompressedLength + " compressed="
 						+ compressedLength);
 			}
 			if (uncompressedLength > buffer.length) {
 				throw new IOException("Chunk too large: " + uncompressedLength + " > " + buffer.length);
 			}
-			if (compressedLength > compressed.length) {
+			if (compressedLength > 0 && compressedLength > compressed.length) {
 				throw new IOException("Compressed chunk too large: " + compressedLength + " > " + compressed.length);
 			}
-			int read = readFully(in, compressed, 0, compressedLength);
-			if (read < compressedLength) {
-				throw new EOFException("Unexpected end of compressed chunk: " + read + " < " + compressedLength);
+			if (compressedLength < 0 && payloadLength != uncompressedLength) {
+				throw new EOFException("Unexpected raw chunk length: " + payloadLength + " != " + uncompressedLength);
+			}
+			int read;
+			if (compressedLength > 0) {
+				read = readFully(in, compressed, 0, payloadLength);
+				if (read < payloadLength) {
+					throw new EOFException("Unexpected end of compressed chunk: " + read + " < " + payloadLength);
+				}
+			} else {
+				read = readFully(in, buffer, 0, payloadLength);
+				if (read < payloadLength) {
+					throw new EOFException("Unexpected end of raw chunk: " + read + " < " + payloadLength);
+				}
 			}
 			if (uncompressedLength % OBJECT_INDEX_RECORD_BYTES != 0) {
 				throw new EOFException("Unexpected uncompressed chunk length: " + uncompressedLength);
 			}
-			decompressor.decompress(compressed, 0, buffer, 0, uncompressedLength);
+			if (compressedLength > 0) {
+				try {
+					int decompressed = decompressor.decompress(compressed, 0, payloadLength, buffer, 0,
+							uncompressedLength);
+					if (decompressed != uncompressedLength) {
+						throw new IOException(
+								"Unexpected decompressed length: " + decompressed + " != " + uncompressedLength);
+					}
+				} catch (MalformedInputException e) {
+					throw new IOException("Corrupt LZ4 chunk", e);
+				}
+			}
 			for (int pos = 0; pos < uncompressedLength; pos += OBJECT_INDEX_RECORD_BYTES) {
 				int offset = getInt(buffer, pos);
 				long value = getLong(buffer, pos + Integer.BYTES);
 				if (offset < 0 || offset >= valuesByOffset.length) {
 					throw new IOException("Offset out of range: " + offset + " >= " + valuesByOffset.length);
 				}
-				if (valuesByOffset[offset] != OBJECT_INDEX_MISSING) {
-					throw new IOException("Duplicate mapping for offset " + offset);
+				if (accumulate) {
+					valuesByOffset[offset] += value;
+				} else {
+					if (valuesByOffset[offset] != OBJECT_INDEX_MISSING) {
+						throw new IOException("Duplicate mapping for offset " + offset);
+					}
+					valuesByOffset[offset] = value;
 				}
-				valuesByOffset[offset] = value;
 			}
 		}
 	}
 
-	private void writeChunk(OutputStream out, byte[] buffer, int length) throws IOException {
-		int compressedLength = compressor.compress(buffer, 0, length, compressedBuffer, 0, compressedBuffer.length);
-		putInt(chunkHeader, 0, length);
-		putInt(chunkHeader, Integer.BYTES, compressedLength);
-		out.write(chunkHeader, 0, OBJECT_INDEX_CHUNK_HEADER_BYTES);
-		out.write(compressedBuffer, 0, compressedLength);
+	private void writeChunk(CachedChannel channel, byte[] buffer, int length, WriteBuffers buffers) throws IOException {
+		int payloadCapacity = compressionEnabled ? buffers.compressor.maxCompressedLength(length) : length;
+		int minCapacity = OBJECT_INDEX_CHUNK_HEADER_BYTES + payloadCapacity;
+		ByteBuffer out = writeBufferPool.acquire(minCapacity);
+		if (!out.hasArray()) {
+			writeBufferPool.release(out);
+			throw new IOException("Write buffer must be a heap ByteBuffer with accessible array");
+		}
+
+		byte[] outArray = out.array();
+		int base = out.arrayOffset();
+		int compressedLength;
+		int payloadLength;
+		if (compressionEnabled) {
+			compressedLength = buffers.compressor.compress(buffer, 0, length, outArray,
+					base + OBJECT_INDEX_CHUNK_HEADER_BYTES, outArray.length - (base + OBJECT_INDEX_CHUNK_HEADER_BYTES));
+			payloadLength = compressedLength;
+		} else {
+			System.arraycopy(buffer, 0, outArray, base + OBJECT_INDEX_CHUNK_HEADER_BYTES, length);
+			compressedLength = -length;
+			payloadLength = length;
+		}
+
+		putInt(outArray, base, length);
+		putInt(outArray, base + Integer.BYTES, compressedLength);
+
+		int totalLen = OBJECT_INDEX_CHUNK_HEADER_BYTES + payloadLength;
+		out.clear();
+		out.limit(totalLen);
+
+		long writePos = channel.reserve(totalLen);
+		try {
+			writeFully(channel.channel, out, writePos);
+		} finally {
+			writeBufferPool.release(out);
+		}
 	}
 
-	private void writeChunk(OutputStream out, byte[] buffer, int length, WriteBuffers buffers) throws IOException {
-		int compressedLength = buffers.compressor.compress(buffer, 0, length, buffers.compressedBuffer, 0,
-				buffers.compressedBuffer.length);
-		putInt(buffers.chunkHeader, 0, length);
-		putInt(buffers.chunkHeader, Integer.BYTES, compressedLength);
-		out.write(buffers.chunkHeader, 0, OBJECT_INDEX_CHUNK_HEADER_BYTES);
-		out.write(buffers.compressedBuffer, 0, compressedLength);
+	private static void writeFully(FileChannel channel, ByteBuffer buffer, long position) throws IOException {
+		long pos = position;
+		while (buffer.hasRemaining()) {
+			int written = channel.write(buffer, pos);
+			if (written < 0) {
+				throw new EOFException("FileChannel.write returned " + written);
+			}
+			pos += written;
+		}
 	}
 
 	private static int readFully(InputStream in, byte[] buffer, int offset, int length) throws IOException {
@@ -454,7 +570,38 @@ final class BucketedSequenceWriter implements Closeable {
 
 	@Override
 	public void close() throws IOException {
-		root.close();
+		IOException first = null;
+		try {
+			flush();
+		} catch (IOException e) {
+			first = e;
+		}
+
+		try {
+			channelCache.close();
+		} catch (IOException e) {
+			if (first == null) {
+				first = e;
+			} else {
+				first.addSuppressed(e);
+			}
+		} finally {
+			writeBufferPool.clear();
+		}
+
+		try {
+			root.close();
+		} catch (IOException e) {
+			if (first == null) {
+				first = e;
+			} else {
+				first.addSuppressed(e);
+			}
+		}
+
+		if (first != null) {
+			throw first;
+		}
 	}
 
 	private boolean shouldWriteInParallel() {
@@ -493,6 +640,7 @@ final class BucketedSequenceWriter implements Closeable {
 	}
 
 	private void writeBucketRange(int startBucket, int endBucket) {
+		WriteBuffers buffers = WRITE_BUFFERS.get();
 		for (int bucket = startBucket; bucket < endBucket; bucket++) {
 			int start = bucketOffsets[bucket];
 			int end = bucketOffsets[bucket + 1];
@@ -501,10 +649,13 @@ final class BucketedSequenceWriter implements Closeable {
 			}
 			notifyBucketWrite(bucket);
 			CloseSuppressPath file = root.resolve(bucketFileName(bucket));
-			try (OutputStream out = new BufferedOutputStream(Files.newOutputStream(file, StandardOpenOption.CREATE,
-					StandardOpenOption.WRITE, StandardOpenOption.APPEND), OBJECT_INDEX_IO_BUFFER_BYTES)) {
-				writeRecords(out, sortedOffsets, sortedValues, start, end, WRITE_BUFFERS.get());
+			CachedChannel channel = null;
+			try {
+				channel = channelCache.acquire(bucket, file);
+				writeRecords(channel, sortedOffsets, sortedValues, start, end, buffers);
+				channelCache.release(bucket, channel);
 			} catch (IOException e) {
+				ChannelCache.closeQuietly(channel);
 				throw new UncheckedIOException(e);
 			}
 		}
@@ -517,17 +668,189 @@ final class BucketedSequenceWriter implements Closeable {
 		}
 	}
 
+	private static final class CachedChannel {
+		final FileChannel channel;
+		long position;
+
+		CachedChannel(FileChannel channel, long position) {
+			this.channel = channel;
+			this.position = position;
+		}
+
+		long reserve(int bytes) {
+			long p = position;
+			position += bytes;
+			return p;
+		}
+	}
+
+	private static final class ChannelCache implements Closeable {
+		private final int maxCached;
+		private final LinkedHashMap<Integer, CachedChannel> lru;
+		private final Object lock = new Object();
+
+		ChannelCache(int maxCached) {
+			this.maxCached = Math.max(0, maxCached);
+			this.lru = new LinkedHashMap<>(16, 0.75f, true);
+		}
+
+		CachedChannel acquire(int bucket, CloseSuppressPath file) throws IOException {
+			CachedChannel cached;
+			synchronized (lock) {
+				cached = lru.remove(bucket);
+			}
+			if (cached != null && cached.channel != null && cached.channel.isOpen()) {
+				return cached;
+			}
+			closeQuietly(cached);
+
+			FileChannel channel = FileChannel.open(file, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+			long pos = channel.size();
+			return new CachedChannel(channel, pos);
+		}
+
+		void release(int bucket, CachedChannel ch) {
+			if (ch == null || ch.channel == null || !ch.channel.isOpen() || maxCached == 0) {
+				closeQuietly(ch);
+				return;
+			}
+			CachedChannel toClose = null;
+			synchronized (lock) {
+				lru.put(bucket, ch);
+				if (lru.size() > maxCached) {
+					Map.Entry<Integer, CachedChannel> eldest = lru.entrySet().iterator().next();
+					lru.remove(eldest.getKey());
+					toClose = eldest.getValue();
+				}
+			}
+			closeQuietly(toClose);
+		}
+
+		@Override
+		public void close() throws IOException {
+			List<CachedChannel> toClose;
+			synchronized (lock) {
+				toClose = new ArrayList<>(lru.values());
+				lru.clear();
+			}
+
+			IOException first = null;
+			for (CachedChannel ch : toClose) {
+				try {
+					if (ch != null && ch.channel != null) {
+						ch.channel.close();
+					}
+				} catch (IOException e) {
+					if (first == null) {
+						first = e;
+					} else {
+						first.addSuppressed(e);
+					}
+				}
+			}
+			if (first != null) {
+				throw first;
+			}
+		}
+
+		static void closeQuietly(CachedChannel ch) {
+			if (ch == null || ch.channel == null) {
+				return;
+			}
+			try {
+				ch.channel.close();
+			} catch (IOException ignored) {
+			}
+		}
+	}
+
+	private static final class ByteBufferPool {
+		private final int rounding;
+		private final int maxTotalBytes;
+		private final int maxPerSize;
+		private final int maxBufferBytes;
+
+		private final Object lock = new Object();
+		private final Map<Integer, ArrayDeque<ByteBuffer>> bySize = new HashMap<>();
+		private int totalBytes;
+
+		ByteBufferPool(int rounding, int maxTotalBytes, int maxPerSize, int maxBufferBytes) {
+			this.rounding = Math.max(1, rounding);
+			this.maxTotalBytes = Math.max(0, maxTotalBytes);
+			this.maxPerSize = Math.max(0, maxPerSize);
+			this.maxBufferBytes = Math.max(0, maxBufferBytes);
+		}
+
+		ByteBuffer acquire(int minCapacity) {
+			int cap = roundUp(minCapacity, rounding);
+			if (cap <= 0) {
+				cap = minCapacity;
+			}
+
+			synchronized (lock) {
+				ArrayDeque<ByteBuffer> q = bySize.get(cap);
+				if (q != null) {
+					ByteBuffer buf = q.pollFirst();
+					if (buf != null) {
+						totalBytes -= cap;
+						buf.clear();
+						return buf;
+					}
+				}
+			}
+
+			return ByteBuffer.allocate(cap);
+		}
+
+		void release(ByteBuffer buf) {
+			if (buf == null) {
+				return;
+			}
+
+			int cap = buf.capacity();
+			if (cap <= 0) {
+				return;
+			}
+			if (cap > maxBufferBytes) {
+				return;
+			}
+
+			buf.clear();
+
+			synchronized (lock) {
+				if (totalBytes + cap > maxTotalBytes) {
+					return;
+				}
+				ArrayDeque<ByteBuffer> q = bySize.computeIfAbsent(cap, k -> new ArrayDeque<>());
+				if (q.size() >= maxPerSize) {
+					return;
+				}
+				q.addFirst(buf);
+				totalBytes += cap;
+			}
+		}
+
+		void clear() {
+			synchronized (lock) {
+				bySize.clear();
+				totalBytes = 0;
+			}
+		}
+
+		private static int roundUp(int x, int multiple) {
+			int m = multiple;
+			int r = x % m;
+			return r == 0 ? x : (x + (m - r));
+		}
+	}
+
 	private static final class WriteBuffers {
 		private final byte[] ioBuffer;
-		private final byte[] compressedBuffer;
-		private final byte[] chunkHeader;
-		private final LZ4Compressor compressor;
+		private final Lz4Compressor compressor;
 
 		private WriteBuffers() {
-			compressor = LZ4_FACTORY.fastCompressor();
+			compressor = Lz4Compressor.create(MAX_ACCELERATION);
 			ioBuffer = new byte[OBJECT_INDEX_IO_BUFFER_BYTES];
-			compressedBuffer = new byte[compressor.maxCompressedLength(OBJECT_INDEX_IO_BUFFER_BYTES)];
-			chunkHeader = new byte[OBJECT_INDEX_CHUNK_HEADER_BYTES];
 		}
 	}
 

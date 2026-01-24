@@ -78,22 +78,24 @@ import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.text.NumberFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.stream.Collectors;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
 /**
@@ -103,6 +105,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 	private static final Logger log = LoggerFactory.getLogger(BitmapTriples.class);
 	private static final int OBJECT_INDEX_PARALLEL_FILL_MIN_RECORDS = 1 << 15;
 	private static final int OBJECT_INDEX_PARALLEL_FILL_MIN_GROUPS = 4;
+	private static final long OBJECT_INDEX_PROGRESS_MIN_INTERVAL_MILLIS = 500L;
 
 	protected TripleComponentOrder order;
 
@@ -122,7 +125,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 	CreateOnUsePath diskSequenceLocation;
 
 	protected boolean isClosed;
-	private int objectIndexParallelism = 1;
+	private int objectIndexParallelism = Runtime.getRuntime().availableProcessors();
 	private boolean objectIndexPipelineEnabled = false;
 	private boolean objectIndexBucketParallelWritesEnabled = false;
 	private boolean objectIndexBatchParallelFillEnabled = false;
@@ -236,6 +239,10 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		long x, y, z;
 		long numTriples = 0;
 
+		// Optimization: Mask to check listener only periodically (e.g. every
+		// 65k items)
+		final long listenerMask = 0xFFFF;
+
 		while (it.hasNext()) {
 			TripleID triple = it.next();
 			TripleOrderConvert.swapComponentOrder(triple, TripleComponentOrder.SPO, order);
@@ -286,9 +293,15 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 			lastY = y;
 			lastZ = z;
 
-			ListenerUtil.notifyCond(listener, "Converting to BitmapTriples", numTriples, numTriples, number);
+			// Optimization: avoid calling system clock or listener on every
+			// single triple
+			if ((numTriples & listenerMask) == 0) {
+				ListenerUtil.notifyCond(listener, "Converting to BitmapTriples", numTriples, numTriples, number);
+			}
 			numTriples++;
 		}
+		// Final notification
+		ListenerUtil.notifyCond(listener, "Converting to BitmapTriples", numTriples, numTriples, number);
 
 		if (numTriples > 0) {
 			bitY.append(true);
@@ -771,6 +784,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		StopWatch global = new StopWatch();
 		StopWatch st = new StopWatch();
 		ProgressListener progressListener = ProgressListener.ofNullable(listener);
+		long totalEntries = seqZ.getNumberOfElements();
 
 		// Count the number of appearances of each object
 		long maxCount = 0;
@@ -782,34 +796,56 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		DynamicSequence objectArray = null;
 
 		try {
-			objectStart = createSequence64(diskLocation, "objectCount", BitUtil.log2(seqZ.getNumberOfElements()),
-					numReservedObjects);
-			for (long i = 0; i < seqZ.getNumberOfElements(); i++) {
-				long val = seqZ.get(i);
-				if (val == 0) {
-					throw new RuntimeException("ERROR: There is a zero value in the Z level.");
-				}
-				if (numReservedObjects < val) {
-					while (numReservedObjects < val) {
-						numReservedObjects <<= 1;
+			objectStart = createSequence64(diskLocation, "objectCount", BitUtil.log2(totalEntries), numReservedObjects);
+			int countBucketSize = BucketedSequenceWriter.resolveObjectIndexBucketSize(totalEntries);
+			int countBufferRecords = BucketedSequenceWriter.resolveObjectIndexBufferRecords(totalEntries,
+					countBucketSize);
+			try (BucketedSequenceWriter countWriter = BucketedSequenceWriter.create(diskLocation,
+					"bitmapTriples-objectCountBuckets", totalEntries, countBucketSize, countBufferRecords)) {
+				StageProgress countProgress = new StageProgress(progressListener.sub(0f, 10f), "count objects",
+						totalEntries);
+
+				for (long i = 0; i < totalEntries; i++) {
+					long val = seqZ.get(i);
+					if (val == 0) {
+						throw new RuntimeException("ERROR: There is a zero value in the Z level.");
 					}
-					objectStart.resize(numReservedObjects);
-				}
-				if (numDifferentObjects < val) {
-					numDifferentObjects = val;
+					if (numReservedObjects < val) {
+						while (numReservedObjects < val) {
+							numReservedObjects <<= 1;
+						}
+					}
+					if (numDifferentObjects < val) {
+						numDifferentObjects = val;
+					}
+
+					countWriter.add(val - 1, 1L);
+					if (i % 10_000_000 == 0 && i > 0) {
+						countProgress.report(i + 1, false);
+					}
 				}
 
-				long count = objectStart.get(val - 1) + 1;
-				maxCount = Math.max(count, maxCount);
-				objectStart.set(val - 1, count);
+				countProgress.finish(totalEntries);
+				if (numReservedObjects < numDifferentObjects) {
+					while (numReservedObjects < numDifferentObjects) {
+						numReservedObjects <<= 1;
+					}
+				}
+				objectStart.resize(numReservedObjects);
+
+				ProgressListener materializeListener = new StageProgressListener(progressListener.sub(10f, 20f),
+						"materialize object counts", numDifferentObjects);
+				maxCount = countWriter.materializeCountsTo(objectStart, numDifferentObjects, materializeListener);
 			}
 			log.info("Count Objects in {} Max was: {}", st.stopAndShow(), maxCount);
 			st.reset();
 
 			// Calculate bitmap that separates each object sublist and prefix
 			// starts.
-			bitmapIndex = createBitmap375(diskLocation, "bitmapIndex", seqZ.getNumberOfElements());
+			bitmapIndex = createBitmap375(diskLocation, "bitmapIndex", totalEntries);
 			long tmpCount = 0;
+			StageProgress bitmapProgress = new StageProgress(progressListener.sub(20f, 30f), "build bitmap",
+					numDifferentObjects);
 			for (long i = 0; i < numDifferentObjects; i++) {
 				long count = objectStart.get(i);
 				if (count != 0) {
@@ -817,27 +853,28 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 				}
 				objectStart.set(i, tmpCount);
 				tmpCount += count;
+				bitmapProgress.report(i + 1, false);
 			}
-			if (seqZ.getNumberOfElements() > 0) {
-				bitmapIndex.set(seqZ.getNumberOfElements() - 1, true);
+			bitmapProgress.finish(numDifferentObjects);
+			if (totalEntries > 0) {
+				bitmapIndex.set(totalEntries - 1, true);
 			}
 			log.info("Bitmap in {}", st.stopAndShow());
 			st.reset();
 
 			objectArray = createSequence64(diskLocation, "objectArray", BitUtil.log2(seqY.getNumberOfElements()),
-					seqZ.getNumberOfElements(), true);
-			objectArray.resize(seqZ.getNumberOfElements());
+					totalEntries, true);
+			objectArray.resize(totalEntries);
 
 			// Copy each object reference to its position
 			try (DynamicSequence objectInsertedCount = createSequence64(diskLocation, "objectInsertedCount",
 					BitUtil.log2(maxCount), numDifferentObjects)) {
 				objectInsertedCount.resize(numDifferentObjects);
 
-				int bucketSize = BucketedSequenceWriter.resolveObjectIndexBucketSize(seqZ.getNumberOfElements());
-				int bufferRecords = BucketedSequenceWriter.resolveObjectIndexBufferRecords(seqZ.getNumberOfElements(),
-						bucketSize);
+				int bucketSize = BucketedSequenceWriter.resolveObjectIndexBucketSize(totalEntries);
+				int bufferRecords = BucketedSequenceWriter.resolveObjectIndexBufferRecords(totalEntries, bucketSize);
 				try (BucketedSequenceWriter writer = BucketedSequenceWriter.create(diskLocation,
-						"bitmapTriples-objectIndexBuckets", seqZ.getNumberOfElements(), bucketSize, bufferRecords)) {
+						"bitmapTriples-objectIndexBuckets", totalEntries, bucketSize, bufferRecords)) {
 					boolean bucketParallelWrites = objectIndexParallelism > 1;
 					objectIndexBucketParallelWritesEnabled = bucketParallelWrites;
 					if (bucketParallelWrites) {
@@ -866,35 +903,42 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 									objectStart, objectInsertedCount, writer, pipeline, directBatch)
 							: null;
 					ObjectIndexEntryBatch entryBatch = null;
-					ObjectIndexEntry[] batch;
+
+					// Replaced ObjectIndexEntry[] with primitive arrays (SoA)
+					long[] batchObjects;
+					long[] batchPosYs;
+
 					if (batchPipeline != null) {
 						entryBatch = batchPipeline.acquire();
-						batch = entryBatch.entries;
+						batchObjects = entryBatch.objects;
+						batchPosYs = entryBatch.posYs;
 					} else {
-						batch = new ObjectIndexEntry[BATCH_SIZE];
-						// Pre-allocate objects to avoid garbage collection
-						// churn
-						// in the loop
-						for (int k = 0; k < BATCH_SIZE; k++) {
-							batch[k] = new ObjectIndexEntry();
-						}
+						// Allocate primitive arrays instead of objects
+						batchObjects = new long[BATCH_SIZE];
+						batchPosYs = new long[BATCH_SIZE];
 					}
 					int batchPtr = 0;
 
+					StageProgress fillProgress = new StageProgress(progressListener.sub(30f, 65f),
+							"fill object index buckets", totalEntries);
 					try {
+						long currentPosY = 0;
+
 						// 3. Main Loop
-						for (long i = 0; i < seqZ.getNumberOfElements(); i++) {
+						for (long i = 0; i < totalEntries; i++) {
 							long objectValue = seqZ.get(i);
 
-							// Vital: Calculate posY NOW while 'i' is
-							// sequential.
-							// This keeps bitmapZ.rank1 fast.
-							long posY = i > 0 ? bitmapZ.rank1(i - 1) : 0;
+							// Optimization: Replaced O(logN) rank1 check with
+							// running counter O(1)
+							long posY = currentPosY;
+							if (bitmapZ.access(i)) {
+								currentPosY++;
+							}
 
 							// Fill batch
-							ObjectIndexEntry entry = batch[batchPtr++];
-							entry.objectValue = objectValue;
-							entry.posY = posY;
+							batchObjects[batchPtr] = objectValue;
+							batchPosYs[batchPtr] = posY;
+							batchPtr++;
 
 							// 4. Process Batch if full
 							if (batchPtr == BATCH_SIZE) {
@@ -902,13 +946,15 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 									entryBatch.length = batchPtr;
 									batchPipeline.submit(entryBatch);
 									entryBatch = batchPipeline.acquire();
-									batch = entryBatch.entries;
+									batchObjects = entryBatch.objects;
+									batchPosYs = entryBatch.posYs;
 								} else {
-									writeObjectIndexBatch(batch, batchPtr, objectStart, objectInsertedCount, writer,
-											pipeline, directBatch, batchScratch, fillPool);
+									writeObjectIndexBatch(batchObjects, batchPosYs, batchPtr, objectStart,
+											objectInsertedCount, writer, pipeline, directBatch, batchScratch, fillPool);
 								}
 								batchPtr = 0;
 							}
+							fillProgress.report(i + 1, false);
 						}
 
 						// 5. Process Remaining Batch
@@ -917,10 +963,11 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 								entryBatch.length = batchPtr;
 								batchPipeline.submit(entryBatch);
 							} else {
-								writeObjectIndexBatch(batch, batchPtr, objectStart, objectInsertedCount, writer,
-										pipeline, directBatch, batchScratch, fillPool);
+								writeObjectIndexBatch(batchObjects, batchPosYs, batchPtr, objectStart,
+										objectInsertedCount, writer, pipeline, directBatch, batchScratch, fillPool);
 							}
 						}
+						fillProgress.finish(totalEntries);
 					} finally {
 						if (batchPipeline != null) {
 							batchPipeline.close();
@@ -933,7 +980,9 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 						}
 					}
 
-					writer.materializeTo(objectArray, progressListener);
+					ProgressListener materializeListener = new StageProgressListener(progressListener.sub(65f, 75f),
+							"materialize buckets", totalEntries);
+					writer.materializeTo(objectArray, materializeListener);
 				}
 				log.info("Object references in {}", st.stopAndShow());
 			}
@@ -945,14 +994,20 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 			if (numDifferentObjects > 0 && numDifferentObjects < parallelism) {
 				parallelism = (int) numDifferentObjects;
 			}
-			sortObjectSublists(seqY, objectArray, bitmapIndex, numDifferentObjects, parallelism);
+			StageProgress sortProgress = new StageProgress(progressListener.sub(75f, 90f), "sort object sublists",
+					totalEntries);
+			sortObjectSublists(seqY, objectArray, bitmapIndex, numDifferentObjects, parallelism, sortProgress);
+			sortProgress.finish(totalEntries);
 
 			log.info("Sort object sublists in {}", st.stopAndShow());
 			st.reset();
 
 			// Count predicates
 			predCount = createSequence64(diskLocation, "predCount", BitUtil.log2(seqY.getNumberOfElements()), 0);
-			for (long i = 0; i < seqY.getNumberOfElements(); i++) {
+			long totalPredicates = seqY.getNumberOfElements();
+			StageProgress predProgress = new StageProgress(progressListener.sub(90f, 100f), "count predicates",
+					totalPredicates);
+			for (long i = 0; i < totalPredicates; i++) {
 				// Read value
 				long val = seqY.get(i);
 
@@ -963,7 +1018,9 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 
 				// Increment
 				predCount.set(val - 1, predCount.get(val - 1) + 1);
+				predProgress.report(i + 1, false);
 			}
+			predProgress.finish(totalPredicates);
 			predCount.trimToSize();
 			log.info("Count predicates in {}", st.stopAndShow());
 		} catch (Throwable t) {
@@ -1004,10 +1061,14 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 
 	}
 
-	private void writeObjectIndexBatch(ObjectIndexEntry[] batch, int batchPtr, DynamicSequence objectStart,
-			DynamicSequence objectInsertedCount, BucketedSequenceWriter writer, ObjectIndexPipeline pipeline,
-			ObjectIndexBatch directBatch, ObjectIndexBatchScratch scratch, ForkJoinPool fillPool) {
-		Arrays.parallelSort(batch, 0, batchPtr, Comparator.comparingLong(o -> o.objectValue));
+	private void writeObjectIndexBatch(long[] batchObjects, long[] batchPosYs, int batchPtr,
+			DynamicSequence objectStart, DynamicSequence objectInsertedCount, BucketedSequenceWriter writer,
+			ObjectIndexPipeline pipeline, ObjectIndexBatch directBatch, ObjectIndexBatchScratch scratch,
+			ForkJoinPool fillPool) {
+
+		// Optimization: Use primitive paired quicksort instead of
+		// Arrays.parallelSort(objects)
+		quickSortPairs(batchObjects, batchPosYs, 0, batchPtr - 1);
 
 		ObjectIndexBatch target = pipeline != null ? pipeline.acquire() : directBatch;
 		target.length = batchPtr;
@@ -1022,7 +1083,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		long currentObject = -1L;
 		int groupStart = 0;
 		for (int k = 0; k < batchPtr; k++) {
-			long objectValue = batch[k].objectValue;
+			long objectValue = batchObjects[k];
 			if (objectValue != currentObject) {
 				if (currentObject != -1L) {
 					groupObjects[groupCount] = currentObject;
@@ -1061,7 +1122,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 					for (int i = 0; i < length; i++) {
 						int idx = start + i;
 						indexes[idx] = base + offset + i;
-						values[idx] = batch[idx].posY;
+						values[idx] = batchPosYs[idx];
 					}
 				})).get();
 			} catch (InterruptedException e) {
@@ -1079,7 +1140,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 				for (int i = 0; i < length; i++) {
 					int idx = start + i;
 					indexes[idx] = base + offset + i;
-					values[idx] = batch[idx].posY;
+					values[idx] = batchPosYs[idx];
 				}
 			}
 		}
@@ -1096,6 +1157,37 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		}
 	}
 
+	private static void quickSortPairs(long[] keys, long[] values, int low, int high) {
+		if (low < high) {
+			int p = partition(keys, values, low, high);
+			quickSortPairs(keys, values, low, p - 1);
+			quickSortPairs(keys, values, p + 1, high);
+		}
+	}
+
+	private static int partition(long[] keys, long[] values, int low, int high) {
+		long pivot = keys[high];
+		int i = (low - 1);
+		for (int j = low; j < high; j++) {
+			if (keys[j] < pivot) {
+				i++;
+				swap(keys, values, i, j);
+			}
+		}
+		swap(keys, values, i + 1, high);
+		return i + 1;
+	}
+
+	private static void swap(long[] keys, long[] values, int i, int j) {
+		long tempKey = keys[i];
+		keys[i] = keys[j];
+		keys[j] = tempKey;
+
+		long tempVal = values[i];
+		values[i] = values[j];
+		values[j] = tempVal;
+	}
+
 	private boolean shouldParallelFill(int batchSize, int groupCount) {
 		if (objectIndexParallelism <= 1) {
 			return false;
@@ -1108,24 +1200,32 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 	}
 
 	private void sortObjectSublists(Sequence seqY, DynamicSequence objectArray, ModifiableBitmap bitmapIndex,
-			long numDifferentObjects, int parallelism) {
+			long numDifferentObjects, int parallelism, StageProgress progress) {
 		if (numDifferentObjects <= 1) {
 			return;
 		}
 		if (parallelism <= 1) {
-			sortObjectSublistsSequential(seqY, objectArray, bitmapIndex, numDifferentObjects);
+			sortObjectSublistsSequential(seqY, objectArray, bitmapIndex, numDifferentObjects, progress);
 			return;
 		}
-		sortObjectSublistsParallel(seqY, objectArray, bitmapIndex, numDifferentObjects, parallelism);
+		sortObjectSublistsParallel(seqY, objectArray, bitmapIndex, numDifferentObjects, parallelism, progress);
 	}
 
 	private void sortObjectSublistsSequential(Sequence seqY, DynamicSequence objectArray, ModifiableBitmap bitmapIndex,
-			long numDifferentObjects) {
+			long numDifferentObjects, StageProgress progress) {
 		long object = 1;
 		long first = 0;
 		long last = bitmapIndex.selectNext1(first) + 1;
+		long processed = 0;
 		do {
 			sortObjectRangeSequential(seqY, objectArray, first, last);
+			long listLen = last - first;
+			if (listLen > 0) {
+				processed += listLen;
+				if (progress != null) {
+					progress.report(processed, false);
+				}
+			}
 			first = last;
 			last = bitmapIndex.selectNext1(first) + 1;
 			object++;
@@ -1133,12 +1233,13 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 	}
 
 	private void sortObjectSublistsParallel(Sequence seqY, DynamicSequence objectArray, ModifiableBitmap bitmapIndex,
-			long numDifferentObjects, int parallelism) {
+			long numDifferentObjects, int parallelism, StageProgress progress) {
 		long batchLimit = resolveObjectIndexSortBatchEntries(objectArray.getNumberOfElements(), parallelism);
 		ForkJoinPool pool = new ForkJoinPool(parallelism);
 		try {
 			List<ObjectSortRange> ranges = new ArrayList<>();
 			long batchEntries = 0L;
+			long processed = 0L;
 
 			long object = 1;
 			long first = 0;
@@ -1154,10 +1255,23 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 					if (batchEntries >= batchLimit) {
 						sortObjectRangesBatch(pool, ranges, seqY, objectArray);
 						ranges.clear();
+						processed += batchEntries;
+						if (progress != null) {
+							progress.report(processed, false);
+						}
 						batchEntries = 0L;
 					}
 				} else if (listLen > 1) {
 					sortObjectRangeSequential(seqY, objectArray, first, last);
+					processed += listLen;
+					if (progress != null) {
+						progress.report(processed, false);
+					}
+				} else if (listLen > 0) {
+					processed += listLen;
+					if (progress != null) {
+						progress.report(processed, false);
+					}
 				}
 				first = last;
 				last = bitmapIndex.selectNext1(first) + 1;
@@ -1166,6 +1280,10 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 
 			if (!ranges.isEmpty()) {
 				sortObjectRangesBatch(pool, ranges, seqY, objectArray);
+				processed += batchEntries;
+				if (progress != null) {
+					progress.report(processed, false);
+				}
 			}
 		} finally {
 			pool.shutdown();
@@ -1241,34 +1359,53 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 	}
 
 	private static void sortByValueThenPosition(long[] values, long[] positions, int from, int to) {
-		int left = from;
-		int right = to - 1;
-		if (left >= right) {
+		int len = to - from;
+		// OPTIMIZATION: Use Insertion Sort for small arrays (Standard Java
+		// DualPivotQuicksort threshold is 47)
+		if (len < 32) {
+			for (int i = from + 1; i < to; i++) {
+				long currentVal = values[i];
+				long currentPos = positions[i];
+				int j = i - 1;
+				while (j >= from && comparePair(values[j], positions[j], currentVal, currentPos) > 0) {
+					values[j + 1] = values[j];
+					positions[j + 1] = positions[j];
+					j--;
+				}
+				values[j + 1] = currentVal;
+				positions[j + 1] = currentPos;
+			}
 			return;
 		}
 
-		int mid = left + ((right - left) >>> 1);
+		// OPTIMIZATION: Median-of-3 pivoting to prevent worst-case O(N^2)
+		int mid = from + (len >> 1);
+		int lo = from;
+		int hi = to - 1;
+
+		if (comparePair(values[mid], positions[mid], values[lo], positions[lo]) < 0) {
+			swap(values, positions, lo, mid);
+		}
+		if (comparePair(values[hi], positions[hi], values[lo], positions[lo]) < 0) {
+			swap(values, positions, lo, hi);
+		}
+		if (comparePair(values[hi], positions[hi], values[mid], positions[mid]) < 0) {
+			swap(values, positions, mid, hi);
+		}
+
 		long pivotValue = values[mid];
 		long pivotPosition = positions[mid];
-		int i = left;
-		int j = right;
+
+		int i = from;
+		int j = to - 1;
 
 		while (i <= j) {
-			while (comparePair(values[i], positions[i], pivotValue, pivotPosition) < 0) {
+			while (comparePair(values[i], positions[i], pivotValue, pivotPosition) < 0)
 				i++;
-			}
-			while (comparePair(values[j], positions[j], pivotValue, pivotPosition) > 0) {
+			while (comparePair(values[j], positions[j], pivotValue, pivotPosition) > 0)
 				j--;
-			}
 			if (i <= j) {
-				long tmpValue = values[i];
-				values[i] = values[j];
-				values[j] = tmpValue;
-
-				long tmpPosition = positions[i];
-				positions[i] = positions[j];
-				positions[j] = tmpPosition;
-
+				swap(values, positions, i, j);
 				i++;
 				j--;
 			}
@@ -1306,20 +1443,16 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		}
 	}
 
-	private static final class ObjectIndexEntry {
-		private long objectValue;
-		private long posY;
-	}
-
 	private static final class ObjectIndexEntryBatch {
-		private final ObjectIndexEntry[] entries;
+		// Replaced Object[] with primitive arrays to avoid Object Overhead and
+		// GC churn
+		private final long[] objects;
+		private final long[] posYs;
 		private int length;
 
 		private ObjectIndexEntryBatch(int capacity) {
-			this.entries = new ObjectIndexEntry[capacity];
-			for (int i = 0; i < capacity; i++) {
-				entries[i] = new ObjectIndexEntry();
-			}
+			this.objects = new long[capacity];
+			this.posYs = new long[capacity];
 		}
 	}
 
@@ -1347,6 +1480,80 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 			groupLengths = new int[capacity];
 			groupBases = new long[capacity];
 			groupOffsets = new long[capacity];
+		}
+	}
+
+	private static final class StageProgress {
+		private static final ThreadLocal<NumberFormat> GROUPED_NUMBERS = ThreadLocal.withInitial(() -> {
+			NumberFormat format = NumberFormat.getIntegerInstance(Locale.US);
+			format.setGroupingUsed(true);
+			format.setMaximumFractionDigits(0);
+			format.setMinimumFractionDigits(0);
+			return format;
+		});
+		private final ProgressListener listener;
+		private final String stage;
+		private final long total;
+		private final long startMillis;
+		private final long minReportCount;
+		private long lastReportCount;
+		private long lastReportMillis;
+
+		private StageProgress(ProgressListener listener, String stage, long total) {
+			this.listener = ProgressListener.ofNullable(listener);
+			this.stage = stage;
+			this.total = Math.max(0L, total);
+			this.startMillis = System.currentTimeMillis();
+			this.lastReportMillis = startMillis;
+			this.minReportCount = Math.max(1L, this.total / 1000L);
+		}
+
+		private void report(long processed, boolean force) {
+			long clamped = Math.max(0L, Math.min(processed, total));
+
+			// OPTIMIZATION: Check count first before checking system clock
+			// (expensive)
+			if (!force && (clamped - lastReportCount) < minReportCount) {
+				return;
+			}
+
+			long now = System.currentTimeMillis();
+			if (!force && (now - lastReportMillis) < OBJECT_INDEX_PROGRESS_MIN_INTERVAL_MILLIS) {
+				return;
+			}
+			lastReportCount = clamped;
+			lastReportMillis = now;
+
+			double elapsedSeconds = (now - startMillis) / 1_000d;
+			long rate = elapsedSeconds > 0d ? (long) (clamped / elapsedSeconds) : clamped;
+			float percent = total > 0L ? (float) (clamped * 100d / total) : 100f;
+			listener.notifyProgress(percent, "object index: {} {}/{} ({} items/s)", stage, formatCount(clamped),
+					formatCount(total), formatCount(rate));
+		}
+
+		private void finish(long processed) {
+			report(processed, true);
+		}
+
+		private static String formatCount(long value) {
+			return GROUPED_NUMBERS.get().format(value);
+		}
+	}
+
+	private static final class StageProgressListener implements ProgressListener {
+		private final StageProgress progress;
+		private final long total;
+
+		private StageProgressListener(ProgressListener listener, String stage, long total) {
+			this.total = Math.max(0L, total);
+			this.progress = new StageProgress(listener, stage, this.total);
+		}
+
+		@Override
+		public void notifyProgress(float level, String message) {
+			float clampedLevel = Math.max(0f, Math.min(100f, level));
+			long processed = total > 0L ? (long) Math.floor(total * (clampedLevel / 100f)) : 0L;
+			progress.report(processed, clampedLevel >= 100f);
 		}
 	}
 
@@ -1397,8 +1604,8 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 					if (batch == poison) {
 						return;
 					}
-					owner.writeObjectIndexBatch(batch.entries, batch.length, objectStart, objectInsertedCount, writer,
-							pipeline, directBatch, scratch, fillPool);
+					owner.writeObjectIndexBatch(batch.objects, batch.posYs, batch.length, objectStart,
+							objectInsertedCount, writer, pipeline, directBatch, scratch, fillPool);
 					batch.length = 0;
 					put(freeBatches, batch);
 				}

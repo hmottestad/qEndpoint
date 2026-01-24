@@ -4,6 +4,7 @@ import com.the_qa_company.qendpoint.core.compact.sequence.DynamicSequence;
 import com.the_qa_company.qendpoint.core.compact.sequence.SequenceLog64;
 import com.the_qa_company.qendpoint.core.listener.ProgressListener;
 import com.the_qa_company.qendpoint.core.util.io.CloseSuppressPath;
+import com.the_qa_company.qendpoint.core.util.io.Lz4Config;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -173,8 +174,52 @@ public class BitmapTriplesBucketedSequenceWriterTest {
 				threads.stream().noneMatch(name -> name.contains("commonPool")));
 	}
 
+	@Test
+	public void bucketFilesWriteRawChunksWhenLz4Disabled() throws Exception {
+		boolean original = Lz4Config.isEnabled();
+		try {
+			Lz4Config.setEnabled(false);
+			long totalEntries = 2L;
+			int bucketSize = 2;
+			int bufferRecords = 4;
+
+			try (CloseSuppressPath root = CloseSuppressPath.of(tempDir.newFolder().toPath())) {
+				root.closeWithDeleteRecurse();
+
+				BucketedSequenceWriter writer = new BucketedSequenceWriter(root, totalEntries, bucketSize,
+						bufferRecords);
+				try {
+					writer.add(0L, 5L);
+					writer.add(1L, 7L);
+
+					DynamicSequence sequence = new SequenceLog64(64, totalEntries, true);
+					writer.materializeTo(sequence);
+
+					Path bucketFile;
+					try (Stream<Path> paths = Files.list(root)) {
+						bucketFile = paths.filter(Files::isRegularFile).findFirst()
+								.orElseThrow(() -> new AssertionError("bucket files written"));
+					}
+
+					byte[] header = new byte[8];
+					try (InputStream in = Files.newInputStream(bucketFile)) {
+						int read = in.read(header);
+						assertEquals("chunk header length", 8, read);
+					}
+					int compressedLength = readInt(header, Integer.BYTES);
+					assertTrue("raw chunk sentinel", compressedLength < 0);
+				} finally {
+					writer.close();
+				}
+			}
+		} finally {
+			Lz4Config.setEnabled(original);
+		}
+	}
+
 	private static int readInt(byte[] buffer, int offset) {
 		return ((buffer[offset] & 0xff) << 24) | ((buffer[offset + 1] & 0xff) << 16)
 				| ((buffer[offset + 2] & 0xff) << 8) | (buffer[offset + 3] & 0xff);
 	}
+
 }
