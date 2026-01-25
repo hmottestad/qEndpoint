@@ -4,6 +4,8 @@ import static org.junit.Assert.fail;
 
 import java.io.File;
 import java.io.InputStream;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -41,6 +43,30 @@ public class BitmapTriplesSortMemoryTest {
 		int exitCode = process.waitFor();
 		if (exitCode != 0) {
 			fail("Child JVM failed with exit code " + exitCode + "\n" + output);
+		}
+	}
+
+	@Test
+	public void timSortTempBufferDoesNotExceedHalf() throws Exception {
+		int length = 1024;
+		long[] values = new long[length];
+		long[] positions = new long[length];
+
+		Class<?> timSortClass = Class
+				.forName("com.the_qa_company.qendpoint.core.triples.impl.BitmapTriples$LongPairTimSort");
+		Constructor<?> ctor = timSortClass.getDeclaredConstructor(long[].class, long[].class, int.class);
+		ctor.setAccessible(true);
+		Object sorter = ctor.newInstance(values, positions, length);
+
+		Method ensureCapacity = timSortClass.getDeclaredMethod("ensureCapacity", int.class);
+		ensureCapacity.setAccessible(true);
+		ensureCapacity.invoke(sorter, length / 2);
+
+		Field tmpValuesField = timSortClass.getDeclaredField("tmpValues");
+		tmpValuesField.setAccessible(true);
+		long[] tmpValues = (long[]) tmpValuesField.get(sorter);
+		if (tmpValues.length > length / 2) {
+			fail("Temp buffer grew to " + tmpValues.length + " for length " + length);
 		}
 	}
 

@@ -1334,7 +1334,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 	}
 
 	private static final int INSERTION_SORT_THRESHOLD = 32;
-	private static final long TIMSORT_TMP_BYTES_PER_ENTRY = 16L;
+	private static final long TIMSORT_TMP_BYTES_PER_ENTRY = 8L;
 	private static final long TIMSORT_TMP_SAFETY_BYTES = 8L * 1024L * 1024L;
 	private static final AtomicInteger ACTIVE_TIMSORTS = new AtomicInteger();
 
@@ -1342,7 +1342,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		long required = TIMSORT_TMP_BYTES_PER_ENTRY * (long) length;
 		int sorts = Math.max(1, concurrentSorts);
 		long perSortBudget = estimateAvailableMemory() / sorts;
-		return required + TIMSORT_TMP_SAFETY_BYTES > perSortBudget;
+		return required + TIMSORT_TMP_SAFETY_BYTES >= perSortBudget;
 	}
 
 	private static long estimateAvailableMemory() {
@@ -1737,6 +1737,11 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 				return;
 			}
 
+			int maxTmp = sortLen >>> 1;
+			if (maxTmp < 1) {
+				maxTmp = 1;
+			}
+
 			int newSize = minCapacity;
 			// Grow roughly to next power-of-two to reduce realloc churn.
 			newSize |= (newSize >> 1);
@@ -1748,8 +1753,12 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 
 			if (newSize < 0) {
 				newSize = minCapacity;
-			} else if (newSize > sortLen) {
-				newSize = sortLen;
+			} else if (newSize > maxTmp) {
+				newSize = maxTmp;
+			}
+
+			if (newSize < minCapacity) {
+				newSize = minCapacity;
 			}
 
 			tmpValues = new long[newSize];
