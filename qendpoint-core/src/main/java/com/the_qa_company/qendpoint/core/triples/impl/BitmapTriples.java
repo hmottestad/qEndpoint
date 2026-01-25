@@ -93,6 +93,8 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.ForkJoinTask;
+import java.util.concurrent.RecursiveAction;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -1315,7 +1317,11 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		int active = ACTIVE_TIMSORTS.incrementAndGet();
 		if (shouldUseInPlaceSort(length, active)) {
 			ACTIVE_TIMSORTS.decrementAndGet();
-			quickSortPairs(values, positions, from, to - 1);
+			if (shouldUseParallelInPlaceSort(length)) {
+				parallelQuickSortPairs(values, positions, from, to - 1);
+			} else {
+				quickSortPairs(values, positions, from, to - 1);
+			}
 			return;
 		}
 		try {
@@ -1334,9 +1340,14 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 	}
 
 	private static final int INSERTION_SORT_THRESHOLD = 32;
+	private static final int PARALLEL_QUICKSORT_THRESHOLD = 1 << 15;
 	private static final long TIMSORT_TMP_BYTES_PER_ENTRY = 8L;
 	private static final long TIMSORT_TMP_SAFETY_BYTES = 8L * 1024L * 1024L;
+	private static final int MEMORY_ESTIMATE_REFRESH_CALLS = 100;
+	private static int MEMORY_ESTIMATE_CALLS = 0;
+	private static volatile long MEMORY_ESTIMATE_CACHE = -1L;
 	private static final AtomicInteger ACTIVE_TIMSORTS = new AtomicInteger();
+	private static final Runtime runtime = Runtime.getRuntime();
 
 	private static boolean shouldUseInPlaceSort(int length, int concurrentSorts) {
 		long required = TIMSORT_TMP_BYTES_PER_ENTRY * (long) length;
@@ -1346,10 +1357,97 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 	}
 
 	private static long estimateAvailableMemory() {
-		Runtime runtime = Runtime.getRuntime();
+		long cached = MEMORY_ESTIMATE_CACHE;
+		int calls = ++MEMORY_ESTIMATE_CALLS;
+		if (cached >= 0 && (calls % MEMORY_ESTIMATE_REFRESH_CALLS) != 0) {
+			return cached;
+		}
 		long used = runtime.totalMemory() - runtime.freeMemory();
 		long available = runtime.maxMemory() - used;
-		return Math.max(0L, available);
+		long clamped = Math.max(0L, available);
+		MEMORY_ESTIMATE_CACHE = clamped;
+		return clamped;
+	}
+
+	private static boolean shouldUseParallelInPlaceSort(int length) {
+		if (length < PARALLEL_QUICKSORT_THRESHOLD) {
+			return false;
+		}
+		return ForkJoinPool.getCommonPoolParallelism() > 1;
+	}
+
+	private static void parallelQuickSortPairs(long[] values, long[] positions, int left, int right) {
+		if (left >= right) {
+			return;
+		}
+		if (right - left < PARALLEL_QUICKSORT_THRESHOLD || ForkJoinPool.getCommonPoolParallelism() <= 1) {
+			quickSortPairs(values, positions, left, right);
+			return;
+		}
+		ForkJoinPool pool = ForkJoinTask.inForkJoinPool() ? ForkJoinTask.getPool() : ForkJoinPool.commonPool();
+		if (pool == null) {
+			quickSortPairs(values, positions, left, right);
+			return;
+		}
+		pool.invoke(new LongPairParallelQuickSortTask(values, positions, left, right));
+	}
+
+	private static final class LongPairParallelQuickSortTask extends RecursiveAction {
+		private final long[] values;
+		private final long[] positions;
+		private final int left;
+		private final int right;
+
+		private LongPairParallelQuickSortTask(long[] values, long[] positions, int left, int right) {
+			this.values = values;
+			this.positions = positions;
+			this.left = left;
+			this.right = right;
+		}
+
+		@Override
+		protected void compute() {
+			if (right - left < PARALLEL_QUICKSORT_THRESHOLD) {
+				quickSortPairs(values, positions, left, right);
+				return;
+			}
+
+			int mid = left + ((right - left) >>> 1);
+			int pivotIndex = medianOfThree(values, positions, left, mid, right);
+			long pivotValue = values[pivotIndex];
+			long pivotPos = positions[pivotIndex];
+
+			int i = left;
+			int j = right;
+			while (i <= j) {
+				while (comparePair(values[i], positions[i], pivotValue, pivotPos) < 0) {
+					i++;
+				}
+				while (comparePair(values[j], positions[j], pivotValue, pivotPos) > 0) {
+					j--;
+				}
+				if (i <= j) {
+					swapPairs(values, positions, i, j);
+					i++;
+					j--;
+				}
+			}
+
+			LongPairParallelQuickSortTask leftTask = left < j
+					? new LongPairParallelQuickSortTask(values, positions, left, j)
+					: null;
+			LongPairParallelQuickSortTask rightTask = i < right
+					? new LongPairParallelQuickSortTask(values, positions, i, right)
+					: null;
+
+			if (leftTask != null && rightTask != null) {
+				invokeAll(leftTask, rightTask);
+			} else if (leftTask != null) {
+				leftTask.compute();
+			} else if (rightTask != null) {
+				rightTask.compute();
+			}
+		}
 	}
 
 	private static void quickSortPairs(long[] values, long[] positions, int left, int right) {
@@ -1446,6 +1544,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 	 */
 	private static final class LongPairTimSort {
 		private static final int MIN_MERGE = 32;
+		private static final int MIN_GALLOP = 7;
 		private static final int INITIAL_TMP_STORAGE_LENGTH = 256;
 
 		private final long[] values;
@@ -1458,6 +1557,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		private final int[] runBase;
 		private final int[] runLen;
 		private int stackSize = 0;
+		private int minGallop = MIN_GALLOP;
 
 		private LongPairTimSort(long[] values, long[] positions, int sortLen) {
 			this.values = values;
@@ -1607,6 +1707,104 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 			}
 		}
 
+		private static int gallopLeft(long pivotValue, long pivotPos, long[] values, long[] positions, int base,
+				int len, int hint) {
+			int lastOfs = 0;
+			int ofs = 1;
+			if (comparePair(pivotValue, pivotPos, values[base + hint], positions[base + hint]) > 0) {
+				int maxOfs = len - hint;
+				while (ofs < maxOfs && comparePair(pivotValue, pivotPos, values[base + hint + ofs],
+						positions[base + hint + ofs]) > 0) {
+					lastOfs = ofs;
+					ofs = (ofs << 1) + 1;
+					if (ofs <= 0) {
+						ofs = maxOfs;
+					}
+				}
+				if (ofs > maxOfs) {
+					ofs = maxOfs;
+				}
+				lastOfs += hint;
+				ofs += hint;
+			} else {
+				int maxOfs = hint + 1;
+				while (ofs < maxOfs && comparePair(pivotValue, pivotPos, values[base + hint - ofs],
+						positions[base + hint - ofs]) <= 0) {
+					lastOfs = ofs;
+					ofs = (ofs << 1) + 1;
+					if (ofs <= 0) {
+						ofs = maxOfs;
+					}
+				}
+				if (ofs > maxOfs) {
+					ofs = maxOfs;
+				}
+				int tmp = lastOfs;
+				lastOfs = hint - ofs;
+				ofs = hint - tmp;
+			}
+
+			lastOfs++;
+			while (lastOfs < ofs) {
+				int mid = lastOfs + ((ofs - lastOfs) >>> 1);
+				if (comparePair(pivotValue, pivotPos, values[base + mid], positions[base + mid]) > 0) {
+					lastOfs = mid + 1;
+				} else {
+					ofs = mid;
+				}
+			}
+			return ofs;
+		}
+
+		private static int gallopRight(long pivotValue, long pivotPos, long[] values, long[] positions, int base,
+				int len, int hint) {
+			int ofs = 1;
+			int lastOfs = 0;
+			if (comparePair(pivotValue, pivotPos, values[base + hint], positions[base + hint]) < 0) {
+				int maxOfs = hint + 1;
+				while (ofs < maxOfs && comparePair(pivotValue, pivotPos, values[base + hint - ofs],
+						positions[base + hint - ofs]) < 0) {
+					lastOfs = ofs;
+					ofs = (ofs << 1) + 1;
+					if (ofs <= 0) {
+						ofs = maxOfs;
+					}
+				}
+				if (ofs > maxOfs) {
+					ofs = maxOfs;
+				}
+				int tmp = lastOfs;
+				lastOfs = hint - ofs;
+				ofs = hint - tmp;
+			} else {
+				int maxOfs = len - hint;
+				while (ofs < maxOfs && comparePair(pivotValue, pivotPos, values[base + hint + ofs],
+						positions[base + hint + ofs]) >= 0) {
+					lastOfs = ofs;
+					ofs = (ofs << 1) + 1;
+					if (ofs <= 0) {
+						ofs = maxOfs;
+					}
+				}
+				if (ofs > maxOfs) {
+					ofs = maxOfs;
+				}
+				lastOfs += hint;
+				ofs += hint;
+			}
+
+			lastOfs++;
+			while (lastOfs < ofs) {
+				int mid = lastOfs + ((ofs - lastOfs) >>> 1);
+				if (comparePair(pivotValue, pivotPos, values[base + mid], positions[base + mid]) < 0) {
+					ofs = mid;
+				} else {
+					lastOfs = mid + 1;
+				}
+			}
+			return ofs;
+		}
+
 		private void pushRun(int base, int len) {
 			runBase[stackSize] = base;
 			runLen[stackSize] = len;
@@ -1659,6 +1857,19 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 				return;
 			}
 
+			int k = gallopRight(values[base2], positions[base2], values, positions, base1, len1, 0);
+			base1 += k;
+			len1 -= k;
+			if (len1 == 0) {
+				return;
+			}
+
+			len2 = gallopLeft(values[base1 + len1 - 1], positions[base1 + len1 - 1], values, positions, base2, len2,
+					len2 - 1);
+			if (len2 == 0) {
+				return;
+			}
+
 			// Copy the smaller run into temp to reduce memory traffic.
 			if (len1 <= len2) {
 				mergeLo(base1, len1, base2, len2);
@@ -1677,26 +1888,119 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 			int cursor2 = base2;
 			int dest = base1;
 
-			int end2 = base2 + len2;
-			while (cursor1 < len1 && cursor2 < end2) {
-				if (comparePair(values[cursor2], positions[cursor2], tmpValues[cursor1], tmpPositions[cursor1]) < 0) {
-					values[dest] = values[cursor2];
-					positions[dest] = positions[cursor2];
-					cursor2++;
-				} else {
-					values[dest] = tmpValues[cursor1];
-					positions[dest] = tmpPositions[cursor1];
-					cursor1++;
-				}
-				dest++;
+			values[dest] = values[cursor2];
+			positions[dest] = positions[cursor2];
+			dest++;
+			cursor2++;
+			if (--len2 == 0) {
+				System.arraycopy(tmpValues, cursor1, values, dest, len1);
+				System.arraycopy(tmpPositions, cursor1, positions, dest, len1);
+				return;
+			}
+			if (len1 == 1) {
+				System.arraycopy(values, cursor2, values, dest, len2);
+				System.arraycopy(positions, cursor2, positions, dest, len2);
+				values[dest + len2] = tmpValues[cursor1];
+				positions[dest + len2] = tmpPositions[cursor1];
+				return;
 			}
 
-			// Copy remainder of left run (right run remainder already in
-			// place).
-			if (cursor1 < len1) {
-				int remaining = len1 - cursor1;
-				System.arraycopy(tmpValues, cursor1, values, dest, remaining);
-				System.arraycopy(tmpPositions, cursor1, positions, dest, remaining);
+			int minGallop = this.minGallop;
+			while (true) {
+				int count1 = 0;
+				int count2 = 0;
+
+				do {
+					if (comparePair(values[cursor2], positions[cursor2], tmpValues[cursor1],
+							tmpPositions[cursor1]) < 0) {
+						values[dest] = values[cursor2];
+						positions[dest] = positions[cursor2];
+						dest++;
+						cursor2++;
+						count2++;
+						count1 = 0;
+						if (--len2 == 0) {
+							break;
+						}
+					} else {
+						values[dest] = tmpValues[cursor1];
+						positions[dest] = tmpPositions[cursor1];
+						dest++;
+						cursor1++;
+						count1++;
+						count2 = 0;
+						if (--len1 == 1) {
+							break;
+						}
+					}
+				} while ((count1 | count2) < minGallop);
+
+				if (len1 <= 1 || len2 == 0) {
+					break;
+				}
+
+				do {
+					count1 = gallopRight(values[cursor2], positions[cursor2], tmpValues, tmpPositions, cursor1, len1,
+							0);
+					if (count1 != 0) {
+						System.arraycopy(tmpValues, cursor1, values, dest, count1);
+						System.arraycopy(tmpPositions, cursor1, positions, dest, count1);
+						dest += count1;
+						cursor1 += count1;
+						len1 -= count1;
+						if (len1 <= 1) {
+							break;
+						}
+					}
+					values[dest] = values[cursor2];
+					positions[dest] = positions[cursor2];
+					dest++;
+					cursor2++;
+					if (--len2 == 0) {
+						break;
+					}
+
+					count2 = gallopLeft(tmpValues[cursor1], tmpPositions[cursor1], values, positions, cursor2, len2, 0);
+					if (count2 != 0) {
+						System.arraycopy(values, cursor2, values, dest, count2);
+						System.arraycopy(positions, cursor2, positions, dest, count2);
+						dest += count2;
+						cursor2 += count2;
+						len2 -= count2;
+						if (len2 == 0) {
+							break;
+						}
+					}
+					values[dest] = tmpValues[cursor1];
+					positions[dest] = tmpPositions[cursor1];
+					dest++;
+					cursor1++;
+					if (--len1 == 1) {
+						break;
+					}
+					minGallop--;
+				} while (count1 >= MIN_GALLOP | count2 >= MIN_GALLOP);
+
+				if (minGallop < 0) {
+					minGallop = 0;
+				}
+				minGallop += 2;
+				if (len1 <= 1 || len2 == 0) {
+					break;
+				}
+			}
+			this.minGallop = minGallop < 1 ? 1 : minGallop;
+
+			if (len1 == 1) {
+				System.arraycopy(values, cursor2, values, dest, len2);
+				System.arraycopy(positions, cursor2, positions, dest, len2);
+				values[dest + len2] = tmpValues[cursor1];
+				positions[dest + len2] = tmpPositions[cursor1];
+			} else if (len1 == 0) {
+				throw new IllegalArgumentException("Comparison method violates its general contract!");
+			} else {
+				System.arraycopy(tmpValues, cursor1, values, dest, len1);
+				System.arraycopy(tmpPositions, cursor1, positions, dest, len1);
 			}
 		}
 
@@ -1710,25 +2014,124 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 			int cursor2 = len2 - 1;
 			int dest = base2 + len2 - 1;
 
-			while (cursor1 >= base1 && cursor2 >= 0) {
-				// Stability (merge from end): on equals pick from right run
-				// (tmp).
-				if (comparePair(values[cursor1], positions[cursor1], tmpValues[cursor2], tmpPositions[cursor2]) > 0) {
-					values[dest] = values[cursor1];
-					positions[dest] = positions[cursor1];
-					cursor1--;
-				} else {
-					values[dest] = tmpValues[cursor2];
-					positions[dest] = tmpPositions[cursor2];
-					cursor2--;
-				}
-				dest--;
+			values[dest] = values[cursor1];
+			positions[dest] = positions[cursor1];
+			dest--;
+			cursor1--;
+			if (--len1 == 0) {
+				System.arraycopy(tmpValues, 0, values, dest - (len2 - 1), len2);
+				System.arraycopy(tmpPositions, 0, positions, dest - (len2 - 1), len2);
+				return;
+			}
+			if (len2 == 1) {
+				dest -= len1;
+				cursor1 -= len1;
+				System.arraycopy(values, cursor1 + 1, values, dest + 1, len1);
+				System.arraycopy(positions, cursor1 + 1, positions, dest + 1, len1);
+				values[dest] = tmpValues[cursor2];
+				positions[dest] = tmpPositions[cursor2];
+				return;
 			}
 
-			// Copy remaining right run to the beginning of the merged area.
-			if (cursor2 >= 0) {
-				System.arraycopy(tmpValues, 0, values, base1, cursor2 + 1);
-				System.arraycopy(tmpPositions, 0, positions, base1, cursor2 + 1);
+			int minGallop = this.minGallop;
+			while (true) {
+				int count1 = 0;
+				int count2 = 0;
+
+				do {
+					if (comparePair(tmpValues[cursor2], tmpPositions[cursor2], values[cursor1],
+							positions[cursor1]) < 0) {
+						values[dest] = values[cursor1];
+						positions[dest] = positions[cursor1];
+						dest--;
+						cursor1--;
+						count1++;
+						count2 = 0;
+						if (--len1 == 0) {
+							break;
+						}
+					} else {
+						values[dest] = tmpValues[cursor2];
+						positions[dest] = tmpPositions[cursor2];
+						dest--;
+						cursor2--;
+						count2++;
+						count1 = 0;
+						if (--len2 == 1) {
+							break;
+						}
+					}
+				} while ((count1 | count2) < minGallop);
+
+				if (len1 == 0 || len2 <= 1) {
+					break;
+				}
+
+				do {
+					count1 = len1 - gallopRight(tmpValues[cursor2], tmpPositions[cursor2], values, positions, base1,
+							len1, len1 - 1);
+					if (count1 != 0) {
+						dest -= count1;
+						cursor1 -= count1;
+						len1 -= count1;
+						System.arraycopy(values, cursor1 + 1, values, dest + 1, count1);
+						System.arraycopy(positions, cursor1 + 1, positions, dest + 1, count1);
+						if (len1 == 0) {
+							break;
+						}
+					}
+					values[dest] = tmpValues[cursor2];
+					positions[dest] = tmpPositions[cursor2];
+					dest--;
+					cursor2--;
+					if (--len2 == 1) {
+						break;
+					}
+
+					count2 = len2 - gallopLeft(values[cursor1], positions[cursor1], tmpValues, tmpPositions, 0, len2,
+							len2 - 1);
+					if (count2 != 0) {
+						dest -= count2;
+						cursor2 -= count2;
+						len2 -= count2;
+						System.arraycopy(tmpValues, cursor2 + 1, values, dest + 1, count2);
+						System.arraycopy(tmpPositions, cursor2 + 1, positions, dest + 1, count2);
+						if (len2 <= 1) {
+							break;
+						}
+					}
+					values[dest] = values[cursor1];
+					positions[dest] = positions[cursor1];
+					dest--;
+					cursor1--;
+					if (--len1 == 0) {
+						break;
+					}
+					minGallop--;
+				} while (count1 >= MIN_GALLOP | count2 >= MIN_GALLOP);
+
+				if (minGallop < 0) {
+					minGallop = 0;
+				}
+				minGallop += 2;
+				if (len1 == 0 || len2 <= 1) {
+					break;
+				}
+			}
+			this.minGallop = minGallop < 1 ? 1 : minGallop;
+
+			if (len2 == 1) {
+				dest -= len1;
+				cursor1 -= len1;
+				System.arraycopy(values, cursor1 + 1, values, dest + 1, len1);
+				System.arraycopy(positions, cursor1 + 1, positions, dest + 1, len1);
+				values[dest] = tmpValues[cursor2];
+				positions[dest] = tmpPositions[cursor2];
+			} else if (len2 == 0) {
+				throw new IllegalArgumentException("Comparison method violates its general contract!");
+			} else {
+				System.arraycopy(tmpValues, 0, values, dest - (len2 - 1), len2);
+				System.arraycopy(tmpPositions, 0, positions, dest - (len2 - 1), len2);
 			}
 		}
 
