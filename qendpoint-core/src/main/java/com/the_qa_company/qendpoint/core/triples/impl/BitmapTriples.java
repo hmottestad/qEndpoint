@@ -94,6 +94,7 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -1307,7 +1308,21 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 	}
 
 	private static void sortByValueThenPosition(long[] values, long[] positions, int from, int to) {
-		LongPairTimSort.sort(values, positions, from, to);
+		int length = to - from;
+		if (length <= 1) {
+			return;
+		}
+		int active = ACTIVE_TIMSORTS.incrementAndGet();
+		if (shouldUseInPlaceSort(length, active)) {
+			ACTIVE_TIMSORTS.decrementAndGet();
+			quickSortPairs(values, positions, from, to - 1);
+			return;
+		}
+		try {
+			LongPairTimSort.sort(values, positions, from, to);
+		} finally {
+			ACTIVE_TIMSORTS.decrementAndGet();
+		}
 	}
 
 	private static int comparePair(long valueA, long positionA, long valueB, long positionB) {
@@ -1316,6 +1331,109 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 			return cmp;
 		}
 		return Long.compare(positionA, positionB);
+	}
+
+	private static final int INSERTION_SORT_THRESHOLD = 32;
+	private static final long TIMSORT_TMP_BYTES_PER_ENTRY = 16L;
+	private static final long TIMSORT_TMP_SAFETY_BYTES = 8L * 1024L * 1024L;
+	private static final AtomicInteger ACTIVE_TIMSORTS = new AtomicInteger();
+
+	private static boolean shouldUseInPlaceSort(int length, int concurrentSorts) {
+		long required = TIMSORT_TMP_BYTES_PER_ENTRY * (long) length;
+		int sorts = Math.max(1, concurrentSorts);
+		long perSortBudget = estimateAvailableMemory() / sorts;
+		return required + TIMSORT_TMP_SAFETY_BYTES > perSortBudget;
+	}
+
+	private static long estimateAvailableMemory() {
+		Runtime runtime = Runtime.getRuntime();
+		long used = runtime.totalMemory() - runtime.freeMemory();
+		long available = runtime.maxMemory() - used;
+		return Math.max(0L, available);
+	}
+
+	private static void quickSortPairs(long[] values, long[] positions, int left, int right) {
+		int lo = left;
+		int hi = right;
+		while (lo < hi) {
+			if (hi - lo < INSERTION_SORT_THRESHOLD) {
+				insertionSortPairs(values, positions, lo, hi);
+				return;
+			}
+			int mid = lo + ((hi - lo) >>> 1);
+			int pivotIndex = medianOfThree(values, positions, lo, mid, hi);
+			long pivotValue = values[pivotIndex];
+			long pivotPos = positions[pivotIndex];
+
+			int i = lo;
+			int j = hi;
+			while (i <= j) {
+				while (comparePair(values[i], positions[i], pivotValue, pivotPos) < 0) {
+					i++;
+				}
+				while (comparePair(values[j], positions[j], pivotValue, pivotPos) > 0) {
+					j--;
+				}
+				if (i <= j) {
+					swapPairs(values, positions, i, j);
+					i++;
+					j--;
+				}
+			}
+
+			if (j - lo < hi - i) {
+				if (lo < j) {
+					quickSortPairs(values, positions, lo, j);
+				}
+				lo = i;
+			} else {
+				if (i < hi) {
+					quickSortPairs(values, positions, i, hi);
+				}
+				hi = j;
+			}
+		}
+	}
+
+	private static int medianOfThree(long[] values, long[] positions, int a, int b, int c) {
+		if (comparePair(values[a], positions[a], values[b], positions[b]) < 0) {
+			if (comparePair(values[b], positions[b], values[c], positions[c]) < 0) {
+				return b;
+			}
+			return comparePair(values[a], positions[a], values[c], positions[c]) < 0 ? c : a;
+		}
+		if (comparePair(values[a], positions[a], values[c], positions[c]) < 0) {
+			return a;
+		}
+		return comparePair(values[b], positions[b], values[c], positions[c]) < 0 ? c : b;
+	}
+
+	private static void insertionSortPairs(long[] values, long[] positions, int left, int right) {
+		for (int i = left + 1; i <= right; i++) {
+			long pivotValue = values[i];
+			long pivotPos = positions[i];
+			int j = i - 1;
+			while (j >= left && comparePair(values[j], positions[j], pivotValue, pivotPos) > 0) {
+				values[j + 1] = values[j];
+				positions[j + 1] = positions[j];
+				j--;
+			}
+			values[j + 1] = pivotValue;
+			positions[j + 1] = pivotPos;
+		}
+	}
+
+	private static void swapPairs(long[] values, long[] positions, int i, int j) {
+		if (i == j) {
+			return;
+		}
+		long value = values[i];
+		values[i] = values[j];
+		values[j] = value;
+
+		long position = positions[i];
+		positions[i] = positions[j];
+		positions[j] = position;
 	}
 
 	/**
@@ -2537,6 +2655,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		public Path createOrGetPath() throws IOException {
 			if (path == null) {
 				path = Files.createTempDirectory("bitmapTriple");
+				mkdir = true;
 			} else {
 				Files.createDirectories(path);
 			}

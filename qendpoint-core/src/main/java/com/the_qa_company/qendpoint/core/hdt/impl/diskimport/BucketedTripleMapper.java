@@ -4,9 +4,10 @@ import com.the_qa_company.qendpoint.core.dictionary.impl.CompressFourSectionDict
 import com.the_qa_company.qendpoint.core.listener.ProgressListener;
 import com.the_qa_company.qendpoint.core.util.io.CloseSuppressPath;
 import com.the_qa_company.qendpoint.core.util.io.Lz4Config;
-import io.airlift.compress.v3.MalformedInputException;
-import io.airlift.compress.v3.lz4.Lz4Compressor;
-import io.airlift.compress.v3.lz4.Lz4Decompressor;
+import net.jpountz.lz4.LZ4Compressor;
+import net.jpountz.lz4.LZ4Exception;
+import net.jpountz.lz4.LZ4Factory;
+import net.jpountz.lz4.LZ4SafeDecompressor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -264,8 +265,8 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 		private final byte[] compressedBuffer;
 		private final byte[] chunkHeader;
 
-		private final Lz4Compressor compressor;
-		private final Lz4Decompressor decompressor;
+		private final LZ4Compressor compressor;
+		private final LZ4SafeDecompressor decompressor;
 
 		private final ChannelCache channelCache;
 		private final ByteBufferPool writeBufferPool;
@@ -303,8 +304,9 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 			sortedOffsets = new int[bufferSize];
 			sortedHeaders = new long[bufferSize];
 
-			compressor = Lz4Compressor.create();
-			decompressor = Lz4Decompressor.create();
+			LZ4Factory factory = LZ4Factory.fastestInstance();
+			compressor = factory.fastCompressor();
+			decompressor = factory.safeDecompressor();
 
 			ioBuffer = new byte[IO_BUFFER_BYTES];
 			compressedBuffer = new byte[compressor.maxCompressedLength(IO_BUFFER_BYTES)];
@@ -856,7 +858,7 @@ public class BucketedTripleMapper implements CompressFourSectionDictionary.NodeC
 							throw new IOException(
 									"Unexpected decompressed length: " + decompressed + " != " + uncompressedLength);
 						}
-					} catch (MalformedInputException e) {
+					} catch (LZ4Exception e) {
 						throw new IOException("Corrupt LZ4 chunk", e);
 					}
 				}

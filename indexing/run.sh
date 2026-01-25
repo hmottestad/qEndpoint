@@ -32,7 +32,7 @@
 export JAVA_OPTIONS="-Xms32G -Xmx32G -XX:+UseParallelGC -XX:+AlwaysPreTouch -XX:+DisableExplicitGC -XX:+UseCompactObjectHeaders"
 #time ./qendpoint-cli-2.5.3/bin/rdf2hdt.sh -index -disk -disklocation ./temp/ -multithread /Users/havardottestad/Documents/wikidata/first_500M_lines_truthy.nt.gz first_500M_lines_truthy.hdt
 #time ./qendpoint-cli-2.5.3/bin/rdf2hdt.sh -index -no-recreate -disk -disklocation ./temp/ -multithread /Users/havardottestad/Documents/wikidata/first_500M_lines_truthy.nt.gz first_500M_lines_truthy.hdt
-
+#
 
 #[main] . [##########] 100.0 done
 #Total Triples ......... 20754779933

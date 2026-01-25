@@ -23,9 +23,10 @@ import com.the_qa_company.qendpoint.core.compact.sequence.DynamicSequence;
 import com.the_qa_company.qendpoint.core.listener.ProgressListener;
 import com.the_qa_company.qendpoint.core.util.io.CloseSuppressPath;
 import com.the_qa_company.qendpoint.core.util.io.Lz4Config;
-import io.airlift.compress.v3.MalformedInputException;
-import io.airlift.compress.v3.lz4.Lz4Compressor;
-import io.airlift.compress.v3.lz4.Lz4Decompressor;
+import net.jpountz.lz4.LZ4Compressor;
+import net.jpountz.lz4.LZ4Exception;
+import net.jpountz.lz4.LZ4Factory;
+import net.jpountz.lz4.LZ4SafeDecompressor;
 
 import java.io.BufferedInputStream;
 import java.io.Closeable;
@@ -62,10 +63,10 @@ final class BucketedSequenceWriter implements Closeable {
 	private static final int WRITE_BUF_POOL_MAX_BYTES = 256 * 1024 * 1024;
 	private static final int WRITE_BUF_POOL_MAX_PER_SIZE = 8;
 	private static final int WRITE_BUF_POOL_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
-	private static final Lz4Decompressor LZ4_DECOMPRESSOR = Lz4Decompressor.create();
+	private static final LZ4Factory LZ4_FACTORY = LZ4Factory.fastestInstance();
+	private static final LZ4SafeDecompressor LZ4_DECOMPRESSOR = LZ4_FACTORY.safeDecompressor();
 	private static final ThreadLocal<WriteBuffers> WRITE_BUFFERS = ThreadLocal.withInitial(WriteBuffers::new);
 	private static volatile BucketWriteObserver bucketWriteObserver;
-	private static final int MAX_ACCELERATION = 65537;
 
 	interface BucketWriteObserver {
 		void onBucketWrite(int bucket, String threadName);
@@ -93,7 +94,7 @@ final class BucketedSequenceWriter implements Closeable {
 	private final byte[] ioBuffer;
 	private final byte[] compressedBuffer;
 	private final byte[] chunkHeader;
-	private final Lz4Decompressor decompressor;
+	private final LZ4SafeDecompressor decompressor;
 	private final ChannelCache channelCache;
 	private final ByteBufferPool writeBufferPool;
 	private final boolean compressionEnabled;
@@ -128,7 +129,7 @@ final class BucketedSequenceWriter implements Closeable {
 		sortedOffsets = new int[bufferRecords];
 		sortedValues = new long[bufferRecords];
 
-		Lz4Compressor sizeCompressor = Lz4Compressor.create(MAX_ACCELERATION);
+		LZ4Compressor sizeCompressor = LZ4_FACTORY.fastCompressor();
 		decompressor = LZ4_DECOMPRESSOR;
 		ioBuffer = new byte[OBJECT_INDEX_IO_BUFFER_BYTES];
 		compressedBuffer = new byte[sizeCompressor.maxCompressedLength(OBJECT_INDEX_IO_BUFFER_BYTES)];
@@ -455,7 +456,7 @@ final class BucketedSequenceWriter implements Closeable {
 						throw new IOException(
 								"Unexpected decompressed length: " + decompressed + " != " + uncompressedLength);
 					}
-				} catch (MalformedInputException e) {
+				} catch (LZ4Exception e) {
 					throw new IOException("Corrupt LZ4 chunk", e);
 				}
 			}
@@ -846,10 +847,10 @@ final class BucketedSequenceWriter implements Closeable {
 
 	private static final class WriteBuffers {
 		private final byte[] ioBuffer;
-		private final Lz4Compressor compressor;
+		private final LZ4Compressor compressor;
 
 		private WriteBuffers() {
-			compressor = Lz4Compressor.create(MAX_ACCELERATION);
+			compressor = LZ4_FACTORY.fastCompressor();
 			ioBuffer = new byte[OBJECT_INDEX_IO_BUFFER_BYTES];
 		}
 	}

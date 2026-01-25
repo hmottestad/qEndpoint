@@ -2,7 +2,8 @@ package com.the_qa_company.qendpoint.core.enums;
 
 import com.the_qa_company.qendpoint.core.util.concurrent.ExceptionFunction;
 import com.the_qa_company.qendpoint.core.util.io.Lz4Config;
-import io.airlift.compress.v3.lz4.Lz4HadoopStreams;
+import net.jpountz.lz4.LZ4BlockInputStream;
+import net.jpountz.lz4.LZ4BlockOutputStream;
 import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream;
 import org.apache.commons.compress.compressors.bzip2.BZip2CompressorOutputStream;
 import org.apache.commons.compress.compressors.lzma.LZMACompressorInputStream;
@@ -87,7 +88,6 @@ public enum CompressionType {
 	private final String[] ext;
 	private final ExceptionFunction<InputStream, InputStream, IOException> decompress;
 	private final ExceptionFunction<OutputStream, OutputStream, IOException> compress;
-	private static final Lz4HadoopStreams LZ4_STREAMS = new Lz4HadoopStreams(true, 64 * 1024);
 
 	CompressionType(ExceptionFunction<InputStream, InputStream, IOException> decompress,
 			ExceptionFunction<OutputStream, OutputStream, IOException> compress, String... ext) {
@@ -130,11 +130,11 @@ public enum CompressionType {
 	}
 
 	private static InputStream lz4Decompress(InputStream stream) throws IOException {
-		return LZ4_STREAMS.createInputStream(stream);
+		return new LZ4BlockInputStream(stream);
 	}
 
 	private static OutputStream lz4Compress(OutputStream stream) throws IOException {
-		return LZ4_STREAMS.createOutputStream(stream);
+		return new LZ4BlockOutputStream(stream);
 	}
 
 	public byte[] debugCompress(byte[] buffer) {

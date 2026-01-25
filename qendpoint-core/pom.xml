@@ -52,7 +52,7 @@
 
         <jena.version>4.3.2</jena.version>
         <slf4j.version>1.7.30</slf4j.version>
-        <aircompressor.version>3.4</aircompressor.version>
+        <lz4-java.version>1.10.2</lz4-java.version>
 
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
@@ -123,9 +123,9 @@
             <version>${roaringbitmap.version}</version>
         </dependency>
         <dependency>
-            <groupId>io.airlift</groupId>
-            <artifactId>aircompressor-v3</artifactId>
-            <version>${aircompressor.version}</version>
+            <groupId>at.yawk.lz4</groupId>
+            <artifactId>lz4-java</artifactId>
+            <version>${lz4-java.version}</version>
         </dependency>
         <dependency>
             <groupId>com.lmax</groupId>

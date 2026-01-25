@@ -32,12 +32,12 @@ public class CompressionTypeTest {
 	}
 
 	@Test
-	public void lz4UsesAirliftHadoopStreams() throws Exception {
+	public void lz4UsesLz4JavaBlockStreams() throws Exception {
 		ByteArrayOutputStream os = new ByteArrayOutputStream();
 		OutputStream out = CompressionType.LZ4.compress(os);
 		try {
-			Class<?> outClass = Class.forName("io.airlift.compress.v3.hadoop.HadoopOutputStream");
-			assertTrue("Expected HadoopOutputStream for LZ4 compression", outClass.isInstance(out));
+			assertEquals("Expected LZ4BlockOutputStream for LZ4 compression", "net.jpountz.lz4.LZ4BlockOutputStream",
+					out.getClass().getName());
 		} finally {
 			out.close();
 		}
@@ -45,8 +45,8 @@ public class CompressionTypeTest {
 		byte[] payload = os.toByteArray();
 		InputStream in = CompressionType.LZ4.decompress(new ByteArrayInputStream(payload));
 		try {
-			Class<?> inClass = Class.forName("io.airlift.compress.v3.hadoop.HadoopInputStream");
-			assertTrue("Expected HadoopInputStream for LZ4 decompression", inClass.isInstance(in));
+			assertEquals("Expected LZ4BlockInputStream for LZ4 decompression", "net.jpountz.lz4.LZ4BlockInputStream",
+					in.getClass().getName());
 		} finally {
 			in.close();
 		}
