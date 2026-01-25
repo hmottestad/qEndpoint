@@ -5,8 +5,10 @@ import org.junit.Test;
 import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.util.Comparator;
+
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertSame;
 
 public class BitmapTriplesSortByValueThenPositionTest {
 	private static final class Pair {
@@ -138,5 +140,20 @@ public class BitmapTriplesSortByValueThenPositionTest {
 			cacheField.setLong(null, originalCache);
 			counterField.setInt(null, originalCounter);
 		}
+	}
+
+	@Test
+	public void longArrayPoolReusesArrays() throws Exception {
+		Class<?> poolClass = Class.forName("com.the_qa_company.qendpoint.core.triples.impl.LongArrayPool");
+		Method borrow = poolClass.getDeclaredMethod("borrow", int.class);
+		Method release = poolClass.getDeclaredMethod("release", long[].class);
+		borrow.setAccessible(true);
+		release.setAccessible(true);
+
+		long[] first = (long[]) borrow.invoke(null, 8);
+		release.invoke(null, new Object[] { first });
+
+		long[] second = (long[]) borrow.invoke(null, 4);
+		assertSame(first, second);
 	}
 }
