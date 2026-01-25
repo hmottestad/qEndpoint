@@ -74,22 +74,22 @@ public class MultiThreadListenerConsole implements MultiThreadListener {
 
 	private static final class MemorySnapshot {
 		private final long used;
-		private final long left;
+		private final long total;
 
-		private MemorySnapshot(long used, long left) {
+		private MemorySnapshot(long used, long total) {
 			this.used = used;
-			this.left = left;
+			this.total = total;
 		}
 
 		private static MemorySnapshot capture() {
 			Runtime runtime = Runtime.getRuntime();
 			long used = runtime.totalMemory() - runtime.freeMemory();
-			long left = Math.max(0L, runtime.maxMemory() - used);
-			return new MemorySnapshot(used, left);
+			long total = runtime.maxMemory();
+			return new MemorySnapshot(used, total);
 		}
 
 		private String format() {
-			return ProfilingUtil.tidyFileSize(used) + "/" + ProfilingUtil.tidyFileSize(left);
+			return ProfilingUtil.tidyFileSize(used) + "/" + ProfilingUtil.tidyFileSize(total);
 		}
 	}
 
@@ -364,7 +364,7 @@ public class MultiThreadListenerConsole implements MultiThreadListener {
 		MemorySnapshot memory = MemorySnapshot.capture();
 		String gcPercent = GC_MONITOR.formatPercentLastMinute();
 		String uptime = formatUptime();
-		return colorReset() + "[" + colorThread() + "stats" + colorReset() + "] mem used/left: " + memory.format()
+		return colorReset() + "[" + colorThread() + "stats" + colorReset() + "] mem used/total: " + memory.format()
 				+ " | gc 60s: " + gcPercent + " | up: " + uptime;
 	}
 

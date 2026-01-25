@@ -239,10 +239,6 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		long x, y, z;
 		long numTriples = 0;
 
-		// Optimization: Mask to check listener only periodically (e.g. every
-		// 65k items)
-		final long listenerMask = 0xFFFF;
-
 		while (it.hasNext()) {
 			TripleID triple = it.next();
 			TripleOrderConvert.swapComponentOrder(triple, TripleComponentOrder.SPO, order);
@@ -293,15 +289,9 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 			lastY = y;
 			lastZ = z;
 
-			// Optimization: avoid calling system clock or listener on every
-			// single triple
-			if ((numTriples & listenerMask) == 0) {
-				ListenerUtil.notifyCond(listener, "Converting to BitmapTriples", numTriples, numTriples, number);
-			}
+			ListenerUtil.notifyCond(listener, "Converting to BitmapTriples", numTriples, numTriples, number);
 			numTriples++;
 		}
-		// Final notification
-		ListenerUtil.notifyCond(listener, "Converting to BitmapTriples", numTriples, numTriples, number);
 
 		if (numTriples > 0) {
 			bitY.append(true);
@@ -820,9 +810,8 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 					}
 
 					countWriter.add(val - 1, 1L);
-					if (i % 10_000_000 == 0 && i > 0) {
-						countProgress.report(i + 1, false);
-					}
+					countProgress.report(i + 1, false);
+
 				}
 
 				countProgress.finish(totalEntries);
@@ -903,42 +892,37 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 									objectStart, objectInsertedCount, writer, pipeline, directBatch)
 							: null;
 					ObjectIndexEntryBatch entryBatch = null;
-
-					// Replaced ObjectIndexEntry[] with primitive arrays (SoA)
-					long[] batchObjects;
-					long[] batchPosYs;
-
+					ObjectIndexEntry[] batch;
 					if (batchPipeline != null) {
 						entryBatch = batchPipeline.acquire();
-						batchObjects = entryBatch.objects;
-						batchPosYs = entryBatch.posYs;
+						batch = entryBatch.entries;
 					} else {
-						// Allocate primitive arrays instead of objects
-						batchObjects = new long[BATCH_SIZE];
-						batchPosYs = new long[BATCH_SIZE];
+						batch = new ObjectIndexEntry[BATCH_SIZE];
+						// Pre-allocate objects to avoid garbage collection
+						// churn
+						// in the loop
+						for (int k = 0; k < BATCH_SIZE; k++) {
+							batch[k] = new ObjectIndexEntry();
+						}
 					}
 					int batchPtr = 0;
 
 					StageProgress fillProgress = new StageProgress(progressListener.sub(30f, 65f),
 							"fill object index buckets", totalEntries);
 					try {
-						long currentPosY = 0;
-
 						// 3. Main Loop
 						for (long i = 0; i < totalEntries; i++) {
 							long objectValue = seqZ.get(i);
 
-							// Optimization: Replaced O(logN) rank1 check with
-							// running counter O(1)
-							long posY = currentPosY;
-							if (bitmapZ.access(i)) {
-								currentPosY++;
-							}
+							// Vital: Calculate posY NOW while 'i' is
+							// sequential.
+							// This keeps bitmapZ.rank1 fast.
+							long posY = i > 0 ? bitmapZ.rank1(i - 1) : 0;
 
 							// Fill batch
-							batchObjects[batchPtr] = objectValue;
-							batchPosYs[batchPtr] = posY;
-							batchPtr++;
+							ObjectIndexEntry entry = batch[batchPtr++];
+							entry.objectValue = objectValue;
+							entry.posY = posY;
 
 							// 4. Process Batch if full
 							if (batchPtr == BATCH_SIZE) {
@@ -946,11 +930,10 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 									entryBatch.length = batchPtr;
 									batchPipeline.submit(entryBatch);
 									entryBatch = batchPipeline.acquire();
-									batchObjects = entryBatch.objects;
-									batchPosYs = entryBatch.posYs;
+									batch = entryBatch.entries;
 								} else {
-									writeObjectIndexBatch(batchObjects, batchPosYs, batchPtr, objectStart,
-											objectInsertedCount, writer, pipeline, directBatch, batchScratch, fillPool);
+									writeObjectIndexBatch(batch, batchPtr, objectStart, objectInsertedCount, writer,
+											pipeline, directBatch, batchScratch, fillPool);
 								}
 								batchPtr = 0;
 							}
@@ -963,8 +946,8 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 								entryBatch.length = batchPtr;
 								batchPipeline.submit(entryBatch);
 							} else {
-								writeObjectIndexBatch(batchObjects, batchPosYs, batchPtr, objectStart,
-										objectInsertedCount, writer, pipeline, directBatch, batchScratch, fillPool);
+								writeObjectIndexBatch(batch, batchPtr, objectStart, objectInsertedCount, writer,
+										pipeline, directBatch, batchScratch, fillPool);
 							}
 						}
 						fillProgress.finish(totalEntries);
@@ -1061,14 +1044,10 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 
 	}
 
-	private void writeObjectIndexBatch(long[] batchObjects, long[] batchPosYs, int batchPtr,
-			DynamicSequence objectStart, DynamicSequence objectInsertedCount, BucketedSequenceWriter writer,
-			ObjectIndexPipeline pipeline, ObjectIndexBatch directBatch, ObjectIndexBatchScratch scratch,
-			ForkJoinPool fillPool) {
-
-		// Optimization: Use primitive paired quicksort instead of
-		// Arrays.parallelSort(objects)
-		quickSortPairs(batchObjects, batchPosYs, 0, batchPtr - 1);
+	private void writeObjectIndexBatch(ObjectIndexEntry[] batch, int batchPtr, DynamicSequence objectStart,
+			DynamicSequence objectInsertedCount, BucketedSequenceWriter writer, ObjectIndexPipeline pipeline,
+			ObjectIndexBatch directBatch, ObjectIndexBatchScratch scratch, ForkJoinPool fillPool) {
+		Arrays.parallelSort(batch, 0, batchPtr, Comparator.comparingLong(o -> o.objectValue));
 
 		ObjectIndexBatch target = pipeline != null ? pipeline.acquire() : directBatch;
 		target.length = batchPtr;
@@ -1083,7 +1062,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		long currentObject = -1L;
 		int groupStart = 0;
 		for (int k = 0; k < batchPtr; k++) {
-			long objectValue = batchObjects[k];
+			long objectValue = batch[k].objectValue;
 			if (objectValue != currentObject) {
 				if (currentObject != -1L) {
 					groupObjects[groupCount] = currentObject;
@@ -1122,7 +1101,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 					for (int i = 0; i < length; i++) {
 						int idx = start + i;
 						indexes[idx] = base + offset + i;
-						values[idx] = batchPosYs[idx];
+						values[idx] = batch[idx].posY;
 					}
 				})).get();
 			} catch (InterruptedException e) {
@@ -1140,7 +1119,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 				for (int i = 0; i < length; i++) {
 					int idx = start + i;
 					indexes[idx] = base + offset + i;
-					values[idx] = batchPosYs[idx];
+					values[idx] = batch[idx].posY;
 				}
 			}
 		}
@@ -1155,37 +1134,6 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		} else {
 			writer.addBatch(target.indexes, target.values, target.length);
 		}
-	}
-
-	private static void quickSortPairs(long[] keys, long[] values, int low, int high) {
-		if (low < high) {
-			int p = partition(keys, values, low, high);
-			quickSortPairs(keys, values, low, p - 1);
-			quickSortPairs(keys, values, p + 1, high);
-		}
-	}
-
-	private static int partition(long[] keys, long[] values, int low, int high) {
-		long pivot = keys[high];
-		int i = (low - 1);
-		for (int j = low; j < high; j++) {
-			if (keys[j] < pivot) {
-				i++;
-				swap(keys, values, i, j);
-			}
-		}
-		swap(keys, values, i + 1, high);
-		return i + 1;
-	}
-
-	private static void swap(long[] keys, long[] values, int i, int j) {
-		long tempKey = keys[i];
-		keys[i] = keys[j];
-		keys[j] = tempKey;
-
-		long tempVal = values[i];
-		values[i] = values[j];
-		values[j] = tempVal;
 	}
 
 	private boolean shouldParallelFill(int batchSize, int groupCount) {
@@ -1359,64 +1307,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 	}
 
 	private static void sortByValueThenPosition(long[] values, long[] positions, int from, int to) {
-		int len = to - from;
-		// OPTIMIZATION: Use Insertion Sort for small arrays (Standard Java
-		// DualPivotQuicksort threshold is 47)
-		if (len < 32) {
-			for (int i = from + 1; i < to; i++) {
-				long currentVal = values[i];
-				long currentPos = positions[i];
-				int j = i - 1;
-				while (j >= from && comparePair(values[j], positions[j], currentVal, currentPos) > 0) {
-					values[j + 1] = values[j];
-					positions[j + 1] = positions[j];
-					j--;
-				}
-				values[j + 1] = currentVal;
-				positions[j + 1] = currentPos;
-			}
-			return;
-		}
-
-		// OPTIMIZATION: Median-of-3 pivoting to prevent worst-case O(N^2)
-		int mid = from + (len >> 1);
-		int lo = from;
-		int hi = to - 1;
-
-		if (comparePair(values[mid], positions[mid], values[lo], positions[lo]) < 0) {
-			swap(values, positions, lo, mid);
-		}
-		if (comparePair(values[hi], positions[hi], values[lo], positions[lo]) < 0) {
-			swap(values, positions, lo, hi);
-		}
-		if (comparePair(values[hi], positions[hi], values[mid], positions[mid]) < 0) {
-			swap(values, positions, mid, hi);
-		}
-
-		long pivotValue = values[mid];
-		long pivotPosition = positions[mid];
-
-		int i = from;
-		int j = to - 1;
-
-		while (i <= j) {
-			while (comparePair(values[i], positions[i], pivotValue, pivotPosition) < 0)
-				i++;
-			while (comparePair(values[j], positions[j], pivotValue, pivotPosition) > 0)
-				j--;
-			if (i <= j) {
-				swap(values, positions, i, j);
-				i++;
-				j--;
-			}
-		}
-
-		if (from < j + 1) {
-			sortByValueThenPosition(values, positions, from, j + 1);
-		}
-		if (i < to) {
-			sortByValueThenPosition(values, positions, i, to);
-		}
+		LongPairTimSort.sort(values, positions, from, to);
 	}
 
 	private static int comparePair(long valueA, long positionA, long valueB, long positionB) {
@@ -1425,6 +1316,327 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 			return cmp;
 		}
 		return Long.compare(positionA, positionB);
+	}
+
+	/**
+	 * TimSort implementation for two parallel long[] arrays.
+	 * <p>
+	 * Sort key is (values[i], positions[i]) using
+	 * {@link #comparePair(long, long, long, long)}. This avoids boxing (Object
+	 * TimSort) and avoids recursive quicksort.
+	 * </p>
+	 */
+	private static final class LongPairTimSort {
+		private static final int MIN_MERGE = 32;
+		private static final int INITIAL_TMP_STORAGE_LENGTH = 256;
+
+		private final long[] values;
+		private final long[] positions;
+		private final int sortLen;
+
+		private long[] tmpValues;
+		private long[] tmpPositions;
+
+		private final int[] runBase;
+		private final int[] runLen;
+		private int stackSize = 0;
+
+		private LongPairTimSort(long[] values, long[] positions, int sortLen) {
+			this.values = values;
+			this.positions = positions;
+			this.sortLen = sortLen;
+
+			int tmpLen = sortLen < 2 * INITIAL_TMP_STORAGE_LENGTH ? (sortLen >>> 1) : INITIAL_TMP_STORAGE_LENGTH;
+			if (tmpLen < 1) {
+				tmpLen = 1;
+			}
+			this.tmpValues = new long[tmpLen];
+			this.tmpPositions = new long[tmpLen];
+
+			int stackLen;
+			if (sortLen < 120) {
+				stackLen = 5;
+			} else if (sortLen < 1542) {
+				stackLen = 10;
+			} else if (sortLen < 119151) {
+				stackLen = 24;
+			} else {
+				stackLen = 40;
+			}
+			this.runBase = new int[stackLen];
+			this.runLen = new int[stackLen];
+		}
+
+		static void sort(long[] values, long[] positions, int from, int to) {
+			int n = to - from;
+			if (n < 2) {
+				return;
+			}
+
+			// Small arrays: detect the first run and finish with binary
+			// insertion sort.
+			if (n < MIN_MERGE) {
+				int initRunLen = countRunAndMakeAscending(values, positions, from, to);
+				binaryInsertionSort(values, positions, from, to, from + initRunLen);
+				return;
+			}
+
+			LongPairTimSort ts = new LongPairTimSort(values, positions, n);
+			int minRun = minRunLength(n);
+
+			int lo = from;
+			int remaining = n;
+			do {
+				int runLen = countRunAndMakeAscending(values, positions, lo, to);
+
+				// If run is short, extend to minRun using binary insertion
+				// sort.
+				if (runLen < minRun) {
+					int force = remaining <= minRun ? remaining : minRun;
+					binaryInsertionSort(values, positions, lo, lo + force, lo + runLen);
+					runLen = force;
+				}
+
+				ts.pushRun(lo, runLen);
+				ts.mergeCollapse();
+
+				lo += runLen;
+				remaining -= runLen;
+			} while (remaining != 0);
+
+			ts.mergeForceCollapse();
+		}
+
+		private static int minRunLength(int n) {
+			int r = 0;
+			while (n >= MIN_MERGE) {
+				r |= (n & 1);
+				n >>= 1;
+			}
+			return n + r;
+		}
+
+		private static int countRunAndMakeAscending(long[] values, long[] positions, int lo, int hi) {
+			int runHi = lo + 1;
+			if (runHi == hi) {
+				return 1;
+			}
+
+			// Decide if ascending or descending.
+			if (comparePair(values[runHi], positions[runHi], values[lo], positions[lo]) < 0) {
+				// Descending
+				while (runHi < hi
+						&& comparePair(values[runHi], positions[runHi], values[runHi - 1], positions[runHi - 1]) < 0) {
+					runHi++;
+				}
+				reverseRange(values, positions, lo, runHi);
+			} else {
+				// Ascending
+				while (runHi < hi
+						&& comparePair(values[runHi], positions[runHi], values[runHi - 1], positions[runHi - 1]) >= 0) {
+					runHi++;
+				}
+			}
+			return runHi - lo;
+		}
+
+		private static void reverseRange(long[] values, long[] positions, int lo, int hi) {
+			int i = lo;
+			int j = hi - 1;
+			while (i < j) {
+				long tmpV = values[i];
+				values[i] = values[j];
+				values[j] = tmpV;
+
+				long tmpP = positions[i];
+				positions[i] = positions[j];
+				positions[j] = tmpP;
+
+				i++;
+				j--;
+			}
+		}
+
+		private static void binaryInsertionSort(long[] values, long[] positions, int lo, int hi, int start) {
+			if (start == lo) {
+				start++;
+			}
+
+			for (; start < hi; start++) {
+				long pivotValue = values[start];
+				long pivotPos = positions[start];
+
+				int left = lo;
+				int right = start;
+
+				// Upper bound (stable): insert after any existing equals.
+				while (left < right) {
+					int mid = (left + right) >>> 1;
+					if (comparePair(pivotValue, pivotPos, values[mid], positions[mid]) < 0) {
+						right = mid;
+					} else {
+						left = mid + 1;
+					}
+				}
+
+				int n = start - left;
+				if (n > 0) {
+					System.arraycopy(values, left, values, left + 1, n);
+					System.arraycopy(positions, left, positions, left + 1, n);
+				}
+				values[left] = pivotValue;
+				positions[left] = pivotPos;
+			}
+		}
+
+		private void pushRun(int base, int len) {
+			runBase[stackSize] = base;
+			runLen[stackSize] = len;
+			stackSize++;
+		}
+
+		private void mergeCollapse() {
+			while (stackSize > 1) {
+				int n = stackSize - 2;
+				if ((n >= 1 && runLen[n - 1] <= runLen[n] + runLen[n + 1])
+						|| (n >= 2 && runLen[n - 2] <= runLen[n - 1] + runLen[n])) {
+					if (runLen[n - 1] < runLen[n + 1]) {
+						n--;
+					}
+					mergeAt(n);
+				} else if (runLen[n] <= runLen[n + 1]) {
+					mergeAt(n);
+				} else {
+					break;
+				}
+			}
+		}
+
+		private void mergeForceCollapse() {
+			while (stackSize > 1) {
+				int n = stackSize - 2;
+				if (n > 0 && runLen[n - 1] < runLen[n + 1]) {
+					n--;
+				}
+				mergeAt(n);
+			}
+		}
+
+		private void mergeAt(int i) {
+			int base1 = runBase[i];
+			int len1 = runLen[i];
+			int base2 = runBase[i + 1];
+			int len2 = runLen[i + 1];
+
+			runLen[i] = len1 + len2;
+			if (i == stackSize - 3) {
+				runBase[i + 1] = runBase[i + 2];
+				runLen[i + 1] = runLen[i + 2];
+			}
+			stackSize--;
+
+			// Already ordered?
+			if (comparePair(values[base1 + len1 - 1], positions[base1 + len1 - 1], values[base2],
+					positions[base2]) <= 0) {
+				return;
+			}
+
+			// Copy the smaller run into temp to reduce memory traffic.
+			if (len1 <= len2) {
+				mergeLo(base1, len1, base2, len2);
+			} else {
+				mergeHi(base1, len1, base2, len2);
+			}
+		}
+
+		private void mergeLo(int base1, int len1, int base2, int len2) {
+			ensureCapacity(len1);
+
+			System.arraycopy(values, base1, tmpValues, 0, len1);
+			System.arraycopy(positions, base1, tmpPositions, 0, len1);
+
+			int cursor1 = 0;
+			int cursor2 = base2;
+			int dest = base1;
+
+			int end2 = base2 + len2;
+			while (cursor1 < len1 && cursor2 < end2) {
+				if (comparePair(values[cursor2], positions[cursor2], tmpValues[cursor1], tmpPositions[cursor1]) < 0) {
+					values[dest] = values[cursor2];
+					positions[dest] = positions[cursor2];
+					cursor2++;
+				} else {
+					values[dest] = tmpValues[cursor1];
+					positions[dest] = tmpPositions[cursor1];
+					cursor1++;
+				}
+				dest++;
+			}
+
+			// Copy remainder of left run (right run remainder already in
+			// place).
+			if (cursor1 < len1) {
+				int remaining = len1 - cursor1;
+				System.arraycopy(tmpValues, cursor1, values, dest, remaining);
+				System.arraycopy(tmpPositions, cursor1, positions, dest, remaining);
+			}
+		}
+
+		private void mergeHi(int base1, int len1, int base2, int len2) {
+			ensureCapacity(len2);
+
+			System.arraycopy(values, base2, tmpValues, 0, len2);
+			System.arraycopy(positions, base2, tmpPositions, 0, len2);
+
+			int cursor1 = base1 + len1 - 1;
+			int cursor2 = len2 - 1;
+			int dest = base2 + len2 - 1;
+
+			while (cursor1 >= base1 && cursor2 >= 0) {
+				// Stability (merge from end): on equals pick from right run
+				// (tmp).
+				if (comparePair(values[cursor1], positions[cursor1], tmpValues[cursor2], tmpPositions[cursor2]) > 0) {
+					values[dest] = values[cursor1];
+					positions[dest] = positions[cursor1];
+					cursor1--;
+				} else {
+					values[dest] = tmpValues[cursor2];
+					positions[dest] = tmpPositions[cursor2];
+					cursor2--;
+				}
+				dest--;
+			}
+
+			// Copy remaining right run to the beginning of the merged area.
+			if (cursor2 >= 0) {
+				System.arraycopy(tmpValues, 0, values, base1, cursor2 + 1);
+				System.arraycopy(tmpPositions, 0, positions, base1, cursor2 + 1);
+			}
+		}
+
+		private void ensureCapacity(int minCapacity) {
+			if (tmpValues.length >= minCapacity) {
+				return;
+			}
+
+			int newSize = minCapacity;
+			// Grow roughly to next power-of-two to reduce realloc churn.
+			newSize |= (newSize >> 1);
+			newSize |= (newSize >> 2);
+			newSize |= (newSize >> 4);
+			newSize |= (newSize >> 8);
+			newSize |= (newSize >> 16);
+			newSize++;
+
+			if (newSize < 0) {
+				newSize = minCapacity;
+			} else if (newSize > sortLen) {
+				newSize = sortLen;
+			}
+
+			tmpValues = new long[newSize];
+			tmpPositions = new long[newSize];
+		}
 	}
 
 	private static long resolveObjectIndexSortBatchEntries(long totalEntries, int parallelism) {
@@ -1443,16 +1655,20 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		}
 	}
 
+	private static final class ObjectIndexEntry {
+		private long objectValue;
+		private long posY;
+	}
+
 	private static final class ObjectIndexEntryBatch {
-		// Replaced Object[] with primitive arrays to avoid Object Overhead and
-		// GC churn
-		private final long[] objects;
-		private final long[] posYs;
+		private final ObjectIndexEntry[] entries;
 		private int length;
 
 		private ObjectIndexEntryBatch(int capacity) {
-			this.objects = new long[capacity];
-			this.posYs = new long[capacity];
+			this.entries = new ObjectIndexEntry[capacity];
+			for (int i = 0; i < capacity; i++) {
+				entries[i] = new ObjectIndexEntry();
+			}
 		}
 	}
 
@@ -1508,12 +1724,14 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 			this.minReportCount = Math.max(1L, this.total / 1000L);
 		}
 
+		int sinceLastReport = 0;
+
 		private void report(long processed, boolean force) {
 			long clamped = Math.max(0L, Math.min(processed, total));
-
-			// OPTIMIZATION: Check count first before checking system clock
-			// (expensive)
 			if (!force && (clamped - lastReportCount) < minReportCount) {
+				return;
+			}
+			if (sinceLastReport++ % 1_000_000 != 0 && !force) {
 				return;
 			}
 
@@ -1604,8 +1822,8 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 					if (batch == poison) {
 						return;
 					}
-					owner.writeObjectIndexBatch(batch.objects, batch.posYs, batch.length, objectStart,
-							objectInsertedCount, writer, pipeline, directBatch, scratch, fillPool);
+					owner.writeObjectIndexBatch(batch.entries, batch.length, objectStart, objectInsertedCount, writer,
+							pipeline, directBatch, scratch, fillPool);
 					batch.length = 0;
 					put(freeBatches, batch);
 				}
@@ -1802,9 +2020,6 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 
 			inner.add(pair);
 
-			if ((i % 100000) == 0) {
-				System.out.println("Processed: " + i + " objects out of " + total);
-			}
 		}
 
 		System.out.println("Serialize object lists");
@@ -1826,10 +2041,6 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 
 				bitmapIndexZ.set(pos, j == inner.size() - 1);
 				pos++;
-			}
-
-			if ((i % 100000) == 0) {
-				System.out.println("Serialized: " + i + " lists out of " + total);
 			}
 
 			// Dereference processed list to let GC release the memory.

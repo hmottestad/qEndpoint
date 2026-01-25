@@ -6,6 +6,8 @@ import org.junit.Test;
 import java.io.ByteArrayOutputStream;
 import java.io.OutputStream;
 import java.io.PrintStream;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -24,6 +26,29 @@ public class MultiThreadListenerConsoleTest {
 		} finally {
 			System.setOut(originalOut);
 		}
+	}
+
+	@Test
+	public void statsLineUsesTotalLabel() throws Exception {
+		MultiThreadListenerConsole console = new MultiThreadListenerConsole(false);
+		Method method = MultiThreadListenerConsole.class.getDeclaredMethod("renderStatsLine");
+		method.setAccessible(true);
+		String line = (String) method.invoke(console);
+		Assert.assertTrue("Expected used/total label", line.contains("mem used/total:"));
+	}
+
+	@Test
+	public void memorySnapshotUsesMaxMemoryAsTotal() throws Exception {
+		Class<?> snapshotClass = Class
+				.forName("com.the_qa_company.qendpoint.core.util.listener.MultiThreadListenerConsole$MemorySnapshot");
+		Method capture = snapshotClass.getDeclaredMethod("capture");
+		capture.setAccessible(true);
+		Object snapshot = capture.invoke(null);
+
+		Field totalField = snapshotClass.getDeclaredField("total");
+		totalField.setAccessible(true);
+		long total = totalField.getLong(snapshot);
+		Assert.assertEquals(Runtime.getRuntime().maxMemory(), total);
 	}
 
 	private static final class LatchOutputStream extends OutputStream {
