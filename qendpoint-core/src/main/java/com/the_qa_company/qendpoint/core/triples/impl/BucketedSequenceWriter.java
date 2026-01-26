@@ -306,22 +306,27 @@ final class BucketedSequenceWriter implements Closeable {
 				return;
 			}
 			int count = (int) Math.min(bucketSize, remaining);
-			long[] values = new long[count];
-			Arrays.fill(values, OBJECT_INDEX_MISSING);
+			long[] values = LongArrayPool.borrow(count);
+			Arrays.fill(values, 0, count, OBJECT_INDEX_MISSING);
 			CloseSuppressPath file = root.resolve(bucketFileName(bucket));
 			if (!Files.exists(file)) {
 				throw new IllegalStateException("Missing bucket file: " + file);
 			}
-			try (InputStream in = new BufferedInputStream(Files.newInputStream(file), OBJECT_INDEX_IO_BUFFER_BYTES)) {
-				readRecords(in, values);
-			}
-
-			for (int i = 0; i < count; i++) {
-				long value = values[i];
-				if (value == OBJECT_INDEX_MISSING) {
-					throw new IllegalStateException("Missing mapping for index=" + (bucketStart + i));
+			try {
+				try (InputStream in = new BufferedInputStream(Files.newInputStream(file),
+						OBJECT_INDEX_IO_BUFFER_BYTES)) {
+					readRecords(in, values);
 				}
-				sequence.set(bucketStart + i, value);
+
+				for (int i = 0; i < count; i++) {
+					long value = values[i];
+					if (value == OBJECT_INDEX_MISSING) {
+						throw new IllegalStateException("Missing mapping for index=" + (bucketStart + i));
+					}
+					sequence.set(bucketStart + i, value);
+				}
+			} finally {
+				LongArrayPool.release(values);
 			}
 			processed += count;
 			int percent = (int) ((processed * 100d) / totalEntries);
@@ -352,23 +357,28 @@ final class BucketedSequenceWriter implements Closeable {
 				break;
 			}
 			int count = (int) Math.min(bucketSize, remaining);
-			long[] values = new long[count];
+			long[] values = LongArrayPool.borrow(count);
+			Arrays.fill(values, 0, count, 0L);
 			CloseSuppressPath file = root.resolve(bucketFileName(bucket));
-			if (Files.exists(file)) {
-				try (InputStream in = new BufferedInputStream(Files.newInputStream(file),
-						OBJECT_INDEX_IO_BUFFER_BYTES)) {
-					readRecords(in, values, true);
-				}
-			}
-
-			for (int i = 0; i < count; i++) {
-				long value = values[i];
-				if (value != 0) {
-					sequence.set(bucketStart + i, value);
-					if (value > maxCount) {
-						maxCount = value;
+			try {
+				if (Files.exists(file)) {
+					try (InputStream in = new BufferedInputStream(Files.newInputStream(file),
+							OBJECT_INDEX_IO_BUFFER_BYTES)) {
+						readRecords(in, values, true);
 					}
 				}
+
+				for (int i = 0; i < count; i++) {
+					long value = values[i];
+					if (value != 0) {
+						sequence.set(bucketStart + i, value);
+						if (value > maxCount) {
+							maxCount = value;
+						}
+					}
+				}
+			} finally {
+				LongArrayPool.release(values);
 			}
 			processed += count;
 			int percent = (int) ((processed * 100d) / maxEntries);

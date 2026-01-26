@@ -8,7 +8,9 @@ import java.util.Comparator;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertSame;
+import static org.junit.Assert.assertTrue;
 
 public class BitmapTriplesSortByValueThenPositionTest {
 	private static final class Pair {
@@ -155,5 +157,111 @@ public class BitmapTriplesSortByValueThenPositionTest {
 
 		long[] second = (long[]) borrow.invoke(null, 4);
 		assertSame(first, second);
+	}
+
+	@Test
+	public void longArrayPoolDisabledDoesNotReuseArrays() throws Exception {
+		Class<?> poolClass = Class.forName("com.the_qa_company.qendpoint.core.triples.impl.LongArrayPool");
+		Method setEnabled = poolClass.getDeclaredMethod("setEnabled", boolean.class);
+		Method borrow = poolClass.getDeclaredMethod("borrow", int.class);
+		Method release = poolClass.getDeclaredMethod("release", long[].class);
+		setEnabled.setAccessible(true);
+		borrow.setAccessible(true);
+		release.setAccessible(true);
+
+		setEnabled.invoke(null, false);
+		try {
+			long[] first = (long[]) borrow.invoke(null, 8);
+			release.invoke(null, new Object[] { first });
+
+			long[] second = (long[]) borrow.invoke(null, 8);
+			assertNotSame(first, second);
+		} finally {
+			setEnabled.invoke(null, true);
+		}
+	}
+
+	@Test
+	public void longArrayPoolShardsByThreadIdModulo() throws Exception {
+		Class<?> poolClass = Class.forName("com.the_qa_company.qendpoint.core.triples.impl.LongArrayPool");
+		Method setEnabled = poolClass.getDeclaredMethod("setEnabled", boolean.class);
+		Method setConcurrency = poolClass.getDeclaredMethod("setConcurrency", int.class);
+		Method borrow = poolClass.getDeclaredMethod("borrow", int.class);
+		Method release = poolClass.getDeclaredMethod("release", long[].class);
+		setEnabled.setAccessible(true);
+		setConcurrency.setAccessible(true);
+		borrow.setAccessible(true);
+		release.setAccessible(true);
+
+		setEnabled.invoke(null, false);
+		setEnabled.invoke(null, true);
+		setConcurrency.invoke(null, 2);
+
+		ThreadResult first = borrowInThread(borrow, release);
+		ThreadResult second = borrowInThread(borrow, release);
+		int attempts = 0;
+		while (first.threadId % 2 == second.threadId % 2 && attempts < 4) {
+			second = borrowInThread(borrow, release);
+			attempts++;
+		}
+
+		assertNotEquals(first.threadId % 2, second.threadId % 2);
+		assertNotSame(first.array, second.array);
+	}
+
+	@Test
+	public void timSortEnsureCapacityGrowsBothBuffers() throws Exception {
+		Class<?> timSortClass = Class
+				.forName("com.the_qa_company.qendpoint.core.triples.impl.BitmapTriples$LongPairTimSort");
+		java.lang.reflect.Constructor<?> ctor = timSortClass.getDeclaredConstructor(long[].class, long[].class,
+				int.class);
+		ctor.setAccessible(true);
+
+		long[] values = new long[512];
+		long[] positions = new long[512];
+		Object sorter = ctor.newInstance(values, positions, 512);
+
+		java.lang.reflect.Field tmpValuesField = timSortClass.getDeclaredField("tmpValues");
+		java.lang.reflect.Field tmpPositionsField = timSortClass.getDeclaredField("tmpPositions");
+		tmpValuesField.setAccessible(true);
+		tmpPositionsField.setAccessible(true);
+		tmpValuesField.set(sorter, new long[512]);
+		tmpPositionsField.set(sorter, new long[256]);
+
+		Method ensureCapacity = timSortClass.getDeclaredMethod("ensureCapacity", int.class);
+		ensureCapacity.setAccessible(true);
+		ensureCapacity.invoke(sorter, 352);
+
+		long[] tmpPositions = (long[]) tmpPositionsField.get(sorter);
+		assertTrue(tmpPositions.length >= 352);
+	}
+
+	private static ThreadResult borrowInThread(Method borrow, Method release) throws Exception {
+		ThreadResult result = new ThreadResult();
+		Throwable[] failure = new Throwable[1];
+		Thread thread = new Thread(() -> {
+			try {
+				result.threadId = Thread.currentThread().getId();
+				result.array = (long[]) borrow.invoke(null, 8);
+				release.invoke(null, new Object[] { result.array });
+			} catch (Throwable throwable) {
+				failure[0] = throwable;
+			}
+		});
+		thread.start();
+		thread.join(5000L);
+		if (thread.isAlive()) {
+			thread.interrupt();
+			throw new AssertionError("Worker thread did not finish in time");
+		}
+		if (failure[0] != null) {
+			throw new AssertionError("Worker thread failed", failure[0]);
+		}
+		return result;
+	}
+
+	private static final class ThreadResult {
+		private long threadId;
+		private long[] array;
 	}
 }

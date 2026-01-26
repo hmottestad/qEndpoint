@@ -1264,9 +1264,10 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 			}
 			ObjectSortRange range = ranges.get(i);
 			long start = range.start;
-			for (int j = 0; j < positions.length; j++) {
+			for (int j = 0; j < range.length; j++) {
 				objectArray.set(start + j, positions[j]);
 			}
+			LongArrayPool.release(positions);
 		}
 	}
 
@@ -1292,21 +1293,34 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		}
 
 		long[] positions = buildSortedPositions(seqY, objectArray, first, length);
-		for (int i = 0; i < positions.length; i++) {
-			objectArray.set(first + i, positions[i]);
+		try {
+			for (int i = 0; i < length; i++) {
+				objectArray.set(first + i, positions[i]);
+			}
+		} finally {
+			LongArrayPool.release(positions);
 		}
 	}
 
 	private static long[] buildSortedPositions(Sequence seqY, DynamicSequence objectArray, long start, int length) {
-		long[] positions = new long[length];
-		long[] values = new long[length];
-		for (int i = 0; i < length; i++) {
-			long pos = objectArray.get(start + i);
-			positions[i] = pos;
-			values[i] = seqY.get(pos);
+		long[] positions = LongArrayPool.borrow(length);
+		long[] values = LongArrayPool.borrow(length);
+		boolean releasePositions = true;
+		try {
+			for (int i = 0; i < length; i++) {
+				long pos = objectArray.get(start + i);
+				positions[i] = pos;
+				values[i] = seqY.get(pos);
+			}
+			sortByValueThenPosition(values, positions, 0, length);
+			releasePositions = false;
+			return positions;
+		} finally {
+			LongArrayPool.release(values);
+			if (releasePositions) {
+				LongArrayPool.release(positions);
+			}
 		}
-		sortByValueThenPosition(values, positions, 0, length);
-		return positions;
 	}
 
 	private static void sortByValueThenPosition(long[] values, long[] positions, int from, int to) {
@@ -1568,8 +1582,8 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 			if (tmpLen < 1) {
 				tmpLen = 1;
 			}
-			this.tmpValues = new long[tmpLen];
-			this.tmpPositions = new long[tmpLen];
+			this.tmpValues = LongArrayPool.borrow(tmpLen);
+			this.tmpPositions = LongArrayPool.borrow(tmpLen);
 
 			int stackLen;
 			if (sortLen < 120) {
@@ -1600,29 +1614,33 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 			}
 
 			LongPairTimSort ts = new LongPairTimSort(values, positions, n);
-			int minRun = minRunLength(n);
+			try {
+				int minRun = minRunLength(n);
 
-			int lo = from;
-			int remaining = n;
-			do {
-				int runLen = countRunAndMakeAscending(values, positions, lo, to);
+				int lo = from;
+				int remaining = n;
+				do {
+					int runLen = countRunAndMakeAscending(values, positions, lo, to);
 
-				// If run is short, extend to minRun using binary insertion
-				// sort.
-				if (runLen < minRun) {
-					int force = remaining <= minRun ? remaining : minRun;
-					binaryInsertionSort(values, positions, lo, lo + force, lo + runLen);
-					runLen = force;
-				}
+					// If run is short, extend to minRun using binary insertion
+					// sort.
+					if (runLen < minRun) {
+						int force = remaining <= minRun ? remaining : minRun;
+						binaryInsertionSort(values, positions, lo, lo + force, lo + runLen);
+						runLen = force;
+					}
 
-				ts.pushRun(lo, runLen);
-				ts.mergeCollapse();
+					ts.pushRun(lo, runLen);
+					ts.mergeCollapse();
 
-				lo += runLen;
-				remaining -= runLen;
-			} while (remaining != 0);
+					lo += runLen;
+					remaining -= runLen;
+				} while (remaining != 0);
 
-			ts.mergeForceCollapse();
+				ts.mergeForceCollapse();
+			} finally {
+				ts.releaseTmp();
+			}
 		}
 
 		private static int minRunLength(int n) {
@@ -2136,7 +2154,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		}
 
 		private void ensureCapacity(int minCapacity) {
-			if (tmpValues.length >= minCapacity) {
+			if (tmpValues.length >= minCapacity && tmpPositions.length >= minCapacity) {
 				return;
 			}
 
@@ -2164,8 +2182,19 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 				newSize = minCapacity;
 			}
 
-			tmpValues = new long[newSize];
-			tmpPositions = new long[newSize];
+			long[] oldValues = tmpValues;
+			long[] oldPositions = tmpPositions;
+			tmpValues = LongArrayPool.borrow(newSize);
+			tmpPositions = LongArrayPool.borrow(newSize);
+			LongArrayPool.release(oldValues);
+			LongArrayPool.release(oldPositions);
+		}
+
+		private void releaseTmp() {
+			LongArrayPool.release(tmpValues);
+			LongArrayPool.release(tmpPositions);
+			tmpValues = new long[1];
+			tmpPositions = new long[1];
 		}
 	}
 
