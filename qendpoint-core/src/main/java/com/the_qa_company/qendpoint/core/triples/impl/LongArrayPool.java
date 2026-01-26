@@ -3,6 +3,7 @@ package com.the_qa_company.qendpoint.core.triples.impl;
 import java.util.ArrayDeque;
 import java.util.NavigableMap;
 import java.util.TreeMap;
+import java.util.concurrent.locks.StampedLock;
 
 final class LongArrayPool {
 	private static final int ARRAY_HEADER_BYTES = 16;
@@ -113,7 +114,7 @@ final class LongArrayPool {
 	}
 
 	private static final class SubPool {
-		private final Object lock = new Object();
+		private final StampedLock lock = new StampedLock();
 		private final NavigableMap<Integer, ArrayDeque<long[]>> pool = new TreeMap<>();
 		private final long maxPoolBytes;
 		private long pooledBytes = 0L;
@@ -123,7 +124,18 @@ final class LongArrayPool {
 		}
 
 		private long[] borrow(int length) {
-			synchronized (lock) {
+			long stamp = lock.readLock();
+			try {
+				var entry = pool.ceilingEntry(length);
+				if (entry == null || entry.getValue().isEmpty()) {
+					return new long[length];
+				}
+			} finally {
+				lock.unlockRead(stamp);
+			}
+
+			long writeStamp = lock.writeLock();
+			try {
 				var entry = pool.ceilingEntry(length);
 				if (entry != null) {
 					ArrayDeque<long[]> deque = entry.getValue();
@@ -136,6 +148,8 @@ final class LongArrayPool {
 						return array;
 					}
 				}
+			} finally {
+				lock.unlockWrite(writeStamp);
 			}
 			return new long[length];
 		}
@@ -145,7 +159,8 @@ final class LongArrayPool {
 			if (bytes <= 0L || maxPoolBytes <= 0L || bytes > maxPoolBytes) {
 				return;
 			}
-			synchronized (lock) {
+			long stamp = lock.writeLock();
+			try {
 				while (pooledBytes + bytes > maxPoolBytes && !pool.isEmpty()) {
 					var entry = pool.lastEntry();
 					if (entry == null) {
@@ -165,13 +180,18 @@ final class LongArrayPool {
 				}
 				pool.computeIfAbsent(array.length, k -> new ArrayDeque<>()).addFirst(array);
 				pooledBytes += bytes;
+			} finally {
+				lock.unlockWrite(stamp);
 			}
 		}
 
 		private void clear() {
-			synchronized (lock) {
+			long stamp = lock.writeLock();
+			try {
 				pool.clear();
 				pooledBytes = 0L;
+			} finally {
+				lock.unlockWrite(stamp);
 			}
 		}
 	}

@@ -2,9 +2,11 @@ package com.the_qa_company.qendpoint.core.triples.impl;
 
 import org.junit.Test;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.concurrent.locks.StampedLock;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
@@ -179,6 +181,15 @@ public class BitmapTriplesSortByValueThenPositionTest {
 		} finally {
 			setEnabled.invoke(null, true);
 		}
+	}
+
+	@Test
+	public void longArrayPoolUsesStampedLock() throws Exception {
+		Class<?> subPoolClass = Class.forName("com.the_qa_company.qendpoint.core.triples.impl.LongArrayPool$SubPool");
+		Field lockField = subPoolClass.getDeclaredField("lock");
+		lockField.setAccessible(true);
+
+		assertEquals(StampedLock.class, lockField.getType());
 	}
 
 	@Test
