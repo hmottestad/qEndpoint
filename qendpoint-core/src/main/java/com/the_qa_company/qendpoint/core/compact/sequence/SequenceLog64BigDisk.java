@@ -34,6 +34,15 @@ import java.util.Iterator;
 public class SequenceLog64BigDisk implements DynamicSequence, Closeable {
 	private static final byte W = 64;
 	private static final int INDEX = 1073741824;
+	private static final long[] BIT_MASK = new long[65];
+
+	static {
+		BIT_MASK[0] = 0L;
+		for (int b = 1; b < 64; b++) {
+			BIT_MASK[b] = (1L << b) - 1L;
+		}
+		BIT_MASK[64] = -1L;
+	}
 
 	LongArray data;
 	private int numbits;
@@ -128,9 +137,10 @@ public class SequenceLog64BigDisk implements DynamicSequence, Closeable {
 		long bitPos = index * bitsField;
 		long i = bitPos / W;
 		long j = bitPos % W;
+		long fieldMask = BIT_MASK[bitsField];
 		long result;
 		if (j + bitsField <= W) {
-			result = (data.get(i) << (W - j - bitsField)) >>> (W - bitsField);
+			result = (data.get(i) >>> j) & fieldMask;
 		} else {
 			result = data.get(i) >>> j;
 			result = result | (data.get(i + 1) << ((W << 1) - j - bitsField)) >>> (W - bitsField);
@@ -150,16 +160,32 @@ public class SequenceLog64BigDisk implements DynamicSequence, Closeable {
 	private static void setField(LongArray data, int bitsField, long index, long value) {
 		if (bitsField == 0)
 			return;
-		long bitPos = index * bitsField;
-		long i = bitPos / W;
-		long j = bitPos % W;
-		long mask = ~(~0L << bitsField) << j;
-		data.set(i, (data.get(i) & ~mask) | (value << j));
 
-		if ((j + bitsField > W)) {
-			mask = ~0L << (bitsField + j - W);
-			data.set(i + 1, (data.get(i + 1) & mask) | value >>> (W - j));
+		final long fieldMask = BIT_MASK[bitsField];
+		final long v = value & fieldMask;
+		final long bitPos = index * (long) bitsField;
+		final long wordIndex = bitPos >> 6;
+		final int bitOffset = (int) (bitPos & 63L);
+
+		final long w0 = data.get(wordIndex);
+		final int endBit = bitOffset + bitsField;
+		if (endBit <= W) {
+			final long maskAtOffset = fieldMask << bitOffset;
+			data.set(wordIndex, (w0 & ~maskAtOffset) | (v << bitOffset));
+			return;
 		}
+
+		final int bitsInFirst = W - bitOffset;
+		final int bitsInSecond = endBit - W;
+		final long maskFirst = BIT_MASK[bitsInFirst];
+		final long maskSecond = BIT_MASK[bitsInSecond];
+		final long newW0 = (w0 & ~(maskFirst << bitOffset)) | ((v & maskFirst) << bitOffset);
+		data.set(wordIndex, newW0);
+
+		final long wordIndex1 = wordIndex + 1;
+		final long w1 = data.get(wordIndex1);
+		final long newW1 = (w1 & ~maskSecond) | ((v >>> bitsInFirst) & maskSecond);
+		data.set(wordIndex1, newW1);
 	}
 
 	private void resizeArray(long size) throws IOException {
@@ -230,6 +256,7 @@ public class SequenceLog64BigDisk implements DynamicSequence, Closeable {
 
 		sortPairsByKey(positions, values, offset, offset + length);
 
+		final long fieldMask = BIT_MASK[numbits];
 		long[] run = getBulkWriteRunBuffer(length);
 		long runStart = -1;
 		int runLength = 0;
@@ -348,7 +375,7 @@ public class SequenceLog64BigDisk implements DynamicSequence, Closeable {
 			}
 
 			final int endBit = bitOffset + numbits;
-			long mask = ~(~0L << numbits) << bitOffset;
+			long mask = fieldMask << bitOffset;
 			currentWordValue = (currentWordValue & ~mask) | (value << bitOffset);
 			currentDirty = true;
 
