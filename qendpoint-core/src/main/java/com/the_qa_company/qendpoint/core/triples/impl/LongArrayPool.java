@@ -1,6 +1,6 @@
 package com.the_qa_company.qendpoint.core.triples.impl;
 
-import java.util.ArrayDeque;
+import java.util.Arrays;
 import java.util.NavigableMap;
 import java.util.TreeMap;
 import java.util.concurrent.locks.StampedLock;
@@ -115,7 +115,7 @@ final class LongArrayPool {
 
 	private static final class SubPool {
 		private final StampedLock lock = new StampedLock();
-		private final NavigableMap<Integer, ArrayDeque<long[]>> pool = new TreeMap<>();
+		private final NavigableMap<Integer, LongArrayStack> pool = new TreeMap<>();
 		private final long maxPoolBytes;
 		private long pooledBytes = 0L;
 
@@ -125,22 +125,26 @@ final class LongArrayPool {
 
 		private long[] borrow(int length) {
 			long stamp = lock.readLock();
+			boolean hasCandidate = false;
 			try {
 				var entry = pool.ceilingEntry(length);
-				if (entry == null || entry.getValue().isEmpty()) {
-					return new long[length];
+				if (entry != null && !entry.getValue().isEmpty()) {
+					hasCandidate = true;
 				}
 			} finally {
 				lock.unlockRead(stamp);
+			}
+			if (!hasCandidate) {
+				return new long[length];
 			}
 
 			long writeStamp = lock.writeLock();
 			try {
 				var entry = pool.ceilingEntry(length);
 				if (entry != null) {
-					ArrayDeque<long[]> deque = entry.getValue();
-					long[] array = deque.pollFirst();
-					if (deque.isEmpty()) {
+					LongArrayStack stack = entry.getValue();
+					long[] array = stack.pop();
+					if (stack.isEmpty()) {
 						pool.remove(entry.getKey());
 					}
 					if (array != null) {
@@ -166,19 +170,19 @@ final class LongArrayPool {
 					if (entry == null) {
 						break;
 					}
-					ArrayDeque<long[]> deque = entry.getValue();
-					long[] removed = deque.pollFirst();
+					LongArrayStack stack = entry.getValue();
+					long[] removed = stack.pop();
 					if (removed != null) {
 						pooledBytes -= estimateBytes(removed.length);
 					}
-					if (deque.isEmpty()) {
+					if (stack.isEmpty()) {
 						pool.remove(entry.getKey());
 					}
 				}
 				if (pooledBytes + bytes > maxPoolBytes) {
 					return;
 				}
-				pool.computeIfAbsent(array.length, k -> new ArrayDeque<>()).addFirst(array);
+				pool.computeIfAbsent(array.length, k -> new LongArrayStack()).push(array);
 				pooledBytes += bytes;
 			} finally {
 				lock.unlockWrite(stamp);
@@ -193,6 +197,32 @@ final class LongArrayPool {
 			} finally {
 				lock.unlockWrite(stamp);
 			}
+		}
+	}
+
+	private static final class LongArrayStack {
+		private long[][] elements = new long[4][];
+		private int size = 0;
+
+		private boolean isEmpty() {
+			return size == 0;
+		}
+
+		private void push(long[] array) {
+			if (size == elements.length) {
+				elements = Arrays.copyOf(elements, size * 2);
+			}
+			elements[size++] = array;
+		}
+
+		private long[] pop() {
+			if (size == 0) {
+				return null;
+			}
+			int index = --size;
+			long[] array = elements[index];
+			elements[index] = null;
+			return array;
 		}
 	}
 }
