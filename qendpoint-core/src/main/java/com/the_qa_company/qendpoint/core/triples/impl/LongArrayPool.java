@@ -9,6 +9,8 @@ final class LongArrayPool {
 	private static final int ARRAY_HEADER_BYTES = 16;
 	private static final String ENABLED_PROPERTY = "qendpoint.longArrayPool.enabled";
 	private static final String CONCURRENCY_PROPERTY = "qendpoint.longArrayPool.concurrency";
+	private static final int MIN_POOLED_LENGTH = 4;
+	private static final int MAX_RETAINED_STACK_LENGTH = 16;
 	private static final int DEFAULT_CONCURRENCY = Math.max(1, Runtime.getRuntime().availableProcessors());
 	private static final long MAX_POOL_BYTES = Math.max(0L, Runtime.getRuntime().maxMemory() / 5L);
 	private static volatile boolean enabled = Boolean.parseBoolean(System.getProperty(ENABLED_PROPERTY, "true"));
@@ -41,7 +43,7 @@ final class LongArrayPool {
 			return new long[0];
 		}
 		int length = Math.max(1, minLength);
-		if (!enabled) {
+		if (!enabled || length < MIN_POOLED_LENGTH) {
 			return new long[length];
 		}
 		return poolGroup.poolForThread().borrow(length);
@@ -52,6 +54,9 @@ final class LongArrayPool {
 			return;
 		}
 		if (array == null || array.length == 0) {
+			return;
+		}
+		if (array.length < MIN_POOLED_LENGTH) {
 			return;
 		}
 		poolGroup.poolForThread().release(array);
@@ -113,6 +118,10 @@ final class LongArrayPool {
 		return Math.max(0L, MAX_POOL_BYTES / concurrency);
 	}
 
+	private static boolean shouldRetainStack(int length) {
+		return length >= MIN_POOLED_LENGTH && length <= MAX_RETAINED_STACK_LENGTH;
+	}
+
 	private static final class SubPool {
 		private final StampedLock lock = new StampedLock();
 		private final NavigableMap<Integer, LongArrayStack> pool = new TreeMap<>();
@@ -128,7 +137,10 @@ final class LongArrayPool {
 			boolean hasCandidate = false;
 			try {
 				var entry = pool.ceilingEntry(length);
-				if (entry != null && !entry.getValue().isEmpty()) {
+				while (entry != null && entry.getValue().isEmpty()) {
+					entry = pool.higherEntry(entry.getKey());
+				}
+				if (entry != null) {
 					hasCandidate = true;
 				}
 			} finally {
@@ -141,16 +153,21 @@ final class LongArrayPool {
 			long writeStamp = lock.writeLock();
 			try {
 				var entry = pool.ceilingEntry(length);
-				if (entry != null) {
+				while (entry != null) {
 					LongArrayStack stack = entry.getValue();
-					long[] array = stack.pop();
-					if (stack.isEmpty()) {
+					if (!stack.isEmpty()) {
+						long[] array = stack.pop();
+						if (stack.isEmpty() && !shouldRetainStack(entry.getKey())) {
+							pool.remove(entry.getKey());
+						}
+						if (array != null) {
+							pooledBytes -= estimateBytes(array.length);
+							return array;
+						}
+					} else if (!shouldRetainStack(entry.getKey())) {
 						pool.remove(entry.getKey());
 					}
-					if (array != null) {
-						pooledBytes -= estimateBytes(array.length);
-						return array;
-					}
+					entry = pool.higherEntry(entry.getKey());
 				}
 			} finally {
 				lock.unlockWrite(writeStamp);
@@ -165,8 +182,14 @@ final class LongArrayPool {
 			}
 			long stamp = lock.writeLock();
 			try {
-				while (pooledBytes + bytes > maxPoolBytes && !pool.isEmpty()) {
+				while (pooledBytes + bytes > maxPoolBytes) {
 					var entry = pool.lastEntry();
+					while (entry != null && entry.getValue().isEmpty()) {
+						if (!shouldRetainStack(entry.getKey())) {
+							pool.remove(entry.getKey());
+						}
+						entry = pool.lowerEntry(entry.getKey());
+					}
 					if (entry == null) {
 						break;
 					}
@@ -175,7 +198,7 @@ final class LongArrayPool {
 					if (removed != null) {
 						pooledBytes -= estimateBytes(removed.length);
 					}
-					if (stack.isEmpty()) {
+					if (stack.isEmpty() && !shouldRetainStack(entry.getKey())) {
 						pool.remove(entry.getKey());
 					}
 				}
@@ -201,7 +224,7 @@ final class LongArrayPool {
 	}
 
 	private static final class LongArrayStack {
-		private long[][] elements = new long[4][];
+		private long[][] elements = new long[1][];
 		private int size = 0;
 
 		private boolean isEmpty() {

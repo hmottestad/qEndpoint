@@ -6,10 +6,12 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.NavigableMap;
 import java.util.concurrent.locks.StampedLock;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
@@ -148,6 +150,7 @@ public class BitmapTriplesSortByValueThenPositionTest {
 
 	@Test
 	public void longArrayPoolReusesArrays() throws Exception {
+		resetLongArrayPool();
 		Class<?> poolClass = Class.forName("com.the_qa_company.qendpoint.core.triples.impl.LongArrayPool");
 		Method borrow = poolClass.getDeclaredMethod("borrow", int.class);
 		Method release = poolClass.getDeclaredMethod("release", long[].class);
@@ -157,8 +160,71 @@ public class BitmapTriplesSortByValueThenPositionTest {
 		long[] first = (long[]) borrow.invoke(null, 8);
 		release.invoke(null, new Object[] { first });
 
-		long[] second = (long[]) borrow.invoke(null, 4);
+		long[] second = (long[]) borrow.invoke(null, 8);
 		assertSame(first, second);
+	}
+
+	@Test
+	public void longArrayPoolSkipsTinyArrays() throws Exception {
+		resetLongArrayPool();
+		Class<?> poolClass = Class.forName("com.the_qa_company.qendpoint.core.triples.impl.LongArrayPool");
+		Method borrow = poolClass.getDeclaredMethod("borrow", int.class);
+		Method release = poolClass.getDeclaredMethod("release", long[].class);
+		borrow.setAccessible(true);
+		release.setAccessible(true);
+
+		long[] first = (long[]) borrow.invoke(null, 3);
+		release.invoke(null, new Object[] { first });
+
+		long[] second = (long[]) borrow.invoke(null, 3);
+		assertNotSame(first, second);
+	}
+
+	@Test
+	public void longArrayPoolRetainsSmallStacks() throws Exception {
+		resetLongArrayPool();
+		Class<?> poolClass = Class.forName("com.the_qa_company.qendpoint.core.triples.impl.LongArrayPool");
+		Method setConcurrency = poolClass.getDeclaredMethod("setConcurrency", int.class);
+		Method borrow = poolClass.getDeclaredMethod("borrow", int.class);
+		Method release = poolClass.getDeclaredMethod("release", long[].class);
+		Field poolGroupField = poolClass.getDeclaredField("poolGroup");
+		setConcurrency.setAccessible(true);
+		borrow.setAccessible(true);
+		release.setAccessible(true);
+		poolGroupField.setAccessible(true);
+
+		Object originalPoolGroup = poolGroupField.get(null);
+		Field concurrencyField = originalPoolGroup.getClass().getDeclaredField("concurrency");
+		concurrencyField.setAccessible(true);
+		int originalConcurrency = concurrencyField.getInt(originalPoolGroup);
+
+		setConcurrency.invoke(null, 1);
+		try {
+			long[] first = (long[]) borrow.invoke(null, 8);
+			release.invoke(null, new Object[] { first });
+
+			long[] second = (long[]) borrow.invoke(null, 8);
+			assertSame(first, second);
+
+			Object poolGroup = poolGroupField.get(null);
+			Field poolsField = poolGroup.getClass().getDeclaredField("pools");
+			poolsField.setAccessible(true);
+			Object[] pools = (Object[]) poolsField.get(poolGroup);
+			Object subPool = pools[0];
+
+			Field poolField = subPool.getClass().getDeclaredField("pool");
+			poolField.setAccessible(true);
+			@SuppressWarnings("unchecked")
+			NavigableMap<Integer, ?> pool = (NavigableMap<Integer, ?>) poolField.get(subPool);
+			Object stack = pool.get(8);
+			assertNotNull(stack);
+
+			Field sizeField = stack.getClass().getDeclaredField("size");
+			sizeField.setAccessible(true);
+			assertEquals(0, sizeField.getInt(stack));
+		} finally {
+			setConcurrency.invoke(null, originalConcurrency);
+		}
 	}
 
 	@Test
@@ -269,6 +335,14 @@ public class BitmapTriplesSortByValueThenPositionTest {
 			throw new AssertionError("Worker thread failed", failure[0]);
 		}
 		return result;
+	}
+
+	private static void resetLongArrayPool() throws Exception {
+		Class<?> poolClass = Class.forName("com.the_qa_company.qendpoint.core.triples.impl.LongArrayPool");
+		Method setEnabled = poolClass.getDeclaredMethod("setEnabled", boolean.class);
+		setEnabled.setAccessible(true);
+		setEnabled.invoke(null, false);
+		setEnabled.invoke(null, true);
 	}
 
 	private static final class ThreadResult {
