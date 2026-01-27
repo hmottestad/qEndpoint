@@ -1,17 +1,11 @@
 package com.the_qa_company.qendpoint.core.iterator.utils;
 
-import com.lmax.disruptor.BusySpinWaitStrategy;
-import com.lmax.disruptor.InsufficientCapacityException;
-import com.lmax.disruptor.RingBuffer;
-import com.lmax.disruptor.Sequence;
-import com.lmax.disruptor.Sequencer;
-
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.Objects;
-import java.util.concurrent.locks.LockSupport;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.function.Function;
 
 /**
@@ -92,81 +86,6 @@ public class PipedCopyIterator<T> implements Iterator<T>, Closeable {
 		int size();
 	}
 
-	interface IdleStrategy {
-		int idle(int idleCounter);
-	}
-
-	private static final class BackoffIdleStrategy implements IdleStrategy {
-		private static final int SPIN_TRIES = 100;
-		private static final int YIELD_TRIES = 1000;
-		private static final long MIN_PARK_NANOS = 1_000L;
-		private static final long MAX_PARK_NANOS = 1_000_000L;
-
-		@Override
-		public int idle(int idleCounter) {
-			if (idleCounter < SPIN_TRIES) {
-				Thread.onSpinWait();
-			} else if (idleCounter < SPIN_TRIES + YIELD_TRIES) {
-				Thread.yield();
-			} else {
-				int parkShift = Math.min(idleCounter - SPIN_TRIES - YIELD_TRIES, 20);
-				long parkNanos = MIN_PARK_NANOS << parkShift;
-				if (parkNanos > MAX_PARK_NANOS) {
-					parkNanos = MAX_PARK_NANOS;
-				}
-				LockSupport.parkNanos(parkNanos);
-			}
-			return idleCounter + 1;
-		}
-	}
-
-	private static final class DisruptorQueue<E> {
-		private static final class Slot<E> {
-			private E value;
-		}
-
-		private final RingBuffer<Slot<E>> ringBuffer;
-		private final Sequence consumerSequence;
-
-		private DisruptorQueue(int capacity) {
-			this.ringBuffer = RingBuffer.createSingleProducer(() -> new Slot<>(), capacity, new BusySpinWaitStrategy());
-			this.consumerSequence = new Sequence(Sequencer.INITIAL_CURSOR_VALUE);
-			this.ringBuffer.addGatingSequences(consumerSequence);
-		}
-
-		boolean offer(E value) {
-			Objects.requireNonNull(value, "value");
-			try {
-				long sequence = ringBuffer.tryNext();
-				Slot<E> slot = ringBuffer.get(sequence);
-				slot.value = value;
-				ringBuffer.publish(sequence);
-				return true;
-			} catch (InsufficientCapacityException e) {
-				return false;
-			}
-		}
-
-		E poll() {
-			long nextSequence = consumerSequence.get() + 1;
-			long availableSequence = ringBuffer.getCursor();
-			if (nextSequence <= availableSequence) {
-				Slot<E> slot = ringBuffer.get(nextSequence);
-				E value = slot.value;
-				slot.value = null;
-				consumerSequence.set(nextSequence);
-				return value;
-			}
-			return null;
-		}
-
-		void clear() {
-			while (poll() != null) {
-				// drain
-			}
-		}
-	}
-
 	private static final class ElementQueueObject<T> implements QueueObject<T> {
 		private final Object[] array;
 
@@ -224,10 +143,8 @@ public class PipedCopyIterator<T> implements Iterator<T>, Closeable {
 	}
 
 	private final int batchSize;
-	private final IdleStrategy idleStrategy;
-	private final DisruptorQueue<QueueObject<T>> activeReadQueue;
-	private final DisruptorQueue<QueueObject<T>> activeWriteQueue;
-	private final DisruptorQueue<Object[]> recycledArrays;
+	private final ArrayBlockingQueue<QueueObject<T>> queue;
+	private final ArrayBlockingQueue<Object[]> recycledArrays;
 
 	private Object[] readArray;
 	private int readArrayIndex;
@@ -259,16 +176,9 @@ public class PipedCopyIterator<T> implements Iterator<T>, Closeable {
 
 		QueueObject<T> obj;
 		try {
-			obj = activeReadQueue.poll();
-			int i = 0;
-			while (obj == null) {
-				i = idleStrategy.idle(i);
-				if (i % 100000 == 0) {
-					changeUpQueues();
-				}
-				obj = activeReadQueue.poll();
-			}
+			obj = queue.take();
 		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
 			throw new PipedIteratorException("Can't read pipe", e);
 		}
 
@@ -377,19 +287,10 @@ public class PipedCopyIterator<T> implements Iterator<T>, Closeable {
 			flushWriteArray();
 		}
 
-		writer = Thread.currentThread();
 		try {
-			QueueObject<T> batch = new ElementQueueObject<>(array, size);
-			boolean offer = activeWriteQueue.offer(batch);
-			int i = 0;
-			while (!offer) {
-				i = idleStrategy.idle(i);
-				if (i % 100000 == 0) {
-					changeUpQueues();
-				}
-				offer = activeWriteQueue.offer(batch);
-			}
+			queue.put(new ElementQueueObject<>(array, size));
 		} catch (InterruptedException ee) {
+			Thread.currentThread().interrupt();
 			throw new PipedIteratorException("Can't add batch to pipe", ee);
 		}
 	}
@@ -398,10 +299,7 @@ public class PipedCopyIterator<T> implements Iterator<T>, Closeable {
 		closePipe(null);
 	}
 
-	boolean closed = false;
-
 	public void closePipe(Throwable e) {
-		closed = true;
 		if (writeArraySize > 0 && e == null) {
 			flushWriteArray();
 		} else {
@@ -409,8 +307,7 @@ public class PipedCopyIterator<T> implements Iterator<T>, Closeable {
 			writeArraySize = 0;
 		}
 		if (e != null) {
-			// Don't drain here: DisruptorQueue consumerSequence must only be
-			// advanced by the consumer thread.
+			queue.clear();
 			if (e instanceof PipedIteratorException) {
 				this.exception = (PipedIteratorException) e;
 			} else {
@@ -418,16 +315,9 @@ public class PipedCopyIterator<T> implements Iterator<T>, Closeable {
 			}
 		}
 		try {
-			boolean offer = activeWriteQueue.offer(new EndQueueObject<>());
-			int i = 0;
-			while (!offer) {
-				i = idleStrategy.idle(i);
-				if (i % 100000 == 0) {
-					changeUpQueues();
-				}
-				offer = activeWriteQueue.offer(new EndQueueObject<>());
-			}
+			queue.put(new EndQueueObject<>());
 		} catch (InterruptedException ee) {
+			Thread.currentThread().interrupt();
 			throw new PipedIteratorException("Can't close pipe", ee);
 		}
 	}
@@ -454,8 +344,6 @@ public class PipedCopyIterator<T> implements Iterator<T>, Closeable {
 		return new MapIterator<>(this, mappingFunction);
 	}
 
-	Thread writer = null;
-
 	public void addElement(T node) {
 		if (writeArray == null) {
 			writeArray = borrowArray();
@@ -480,16 +368,9 @@ public class PipedCopyIterator<T> implements Iterator<T>, Closeable {
 
 		QueueObject<T> obj;
 		try {
-			obj = activeReadQueue.poll();
-			int i = 0;
-			while (obj == null) {
-				i = idleStrategy.idle(i);
-				if (i % 100000 == 0) {
-					changeUpQueues();
-				}
-				obj = activeReadQueue.poll();
-			}
+			obj = queue.take();
 		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
 			throw new PipedIteratorException("Can't read pipe", e);
 		}
 
@@ -522,20 +403,6 @@ public class PipedCopyIterator<T> implements Iterator<T>, Closeable {
 		Arrays.fill(array, 0, Math.min(size, array.length), null);
 		// Best effort: don't block if the recycle queue is full.
 		recycledArrays.offer(array);
-	}
-
-	synchronized void changeUpQueues() throws InterruptedException {
-		if (Thread.interrupted()) {
-			Thread.currentThread().interrupt();
-			throw new InterruptedException();
-		}
-//		var write = activeWriteQueue;
-//		var read = activeReadQueue;
-//
-//		if (read.isEmpty() && !write.isEmpty()) {
-//			activeWriteQueue.drainTo(read);
-//			return;
-//		}
 	}
 
 	/**
@@ -572,18 +439,12 @@ public class PipedCopyIterator<T> implements Iterator<T>, Closeable {
 	}
 
 	public PipedCopyIterator(int batchSize) {
-		this(batchSize, new BackoffIdleStrategy());
-	}
-
-	PipedCopyIterator(int batchSize, IdleStrategy idleStrategy) {
 		if (batchSize <= 0) {
 			throw new IllegalArgumentException("batchSize must be > 0");
 		}
 		this.batchSize = batchSize;
-		this.idleStrategy = Objects.requireNonNull(idleStrategy, "idleStrategy");
 		int queueCapacity = queueBatchCapacity(batchSize);
-		this.activeReadQueue = new DisruptorQueue<>(queueCapacity);
-		this.activeWriteQueue = this.activeReadQueue;
-		this.recycledArrays = new DisruptorQueue<>(nextPowerOfTwo(queueCapacity * 2));
+		this.queue = new ArrayBlockingQueue<>(queueCapacity);
+		this.recycledArrays = new ArrayBlockingQueue<>(nextPowerOfTwo(queueCapacity * 2));
 	}
 }

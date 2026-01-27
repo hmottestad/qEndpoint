@@ -48,7 +48,6 @@
         <logback.version>1.5.6</logback.version>
         <roaringbitmap.version>0.9.44</roaringbitmap.version>
         <commons-compress.version>1.26.0</commons-compress.version>
-        <disruptor.version>3.4.4</disruptor.version>
 
         <jena.version>4.3.2</jena.version>
         <slf4j.version>1.7.30</slf4j.version>
@@ -126,11 +125,6 @@
             <groupId>at.yawk.lz4</groupId>
             <artifactId>lz4-java</artifactId>
             <version>${lz4-java.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>com.lmax</groupId>
-            <artifactId>disruptor</artifactId>
-            <version>${disruptor.version}</version>
         </dependency>
     </dependencies>
 </project>
