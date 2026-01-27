@@ -45,7 +45,7 @@ export JAVA_OPTIONS="-Xms32G -Xmx32G -XX:+UseParallelGC -XX:+AlwaysPreTouch -XX:
 #user    1272m56.135s
 #sys     303m49.361s
 export JAVA_OPTIONS="-Xms64G -Xmx64G -XX:+UseParallelGC -XX:+AlwaysPreTouch -XX:+DisableExplicitGC -XX:+UseCompactObjectHeaders"
-#time ./qendpoint-cli-2.5.3/bin/rdf2hdt.sh -disk -disklocation ./temp/ -multithread /Users/havardottestad/Documents/wikidata/wikidata-20251208-all-BETA.nt.gz wikidata-20251208-all-BETA.hdt
+time ./qendpoint-cli-2.5.3/bin/rdf2hdt.sh -disk -disklocation ./temp/ -multithread /Users/havardottestad/Documents/wikidata/wikidata-20251208-all-BETA.nt.gz wikidata-20251208-all-BETA.hdt
 
 
 
@@ -68,5 +68,5 @@ export JAVA_OPTIONS="-Xms64G -Xmx64G -XX:+UseParallelGC -XX:+AlwaysPreTouch -XX:
 #real    89m25.573s
 #user    82m30.482s
 #sys     15m27.199s
-time ./qendpoint-cli-2.5.3/bin/rdf2hdt.sh -index -no-recreate -disk -disklocation ./temp/ -multithread /Users/havardottestad/Documents/wikidata/wikidata-20251208-all-BETA.nt.gz wikidata-20251208-all-BETA.hdt
+#time ./qendpoint-cli-2.5.3/bin/rdf2hdt.sh -index -no-recreate -disk -disklocation ./temp/ -multithread /Users/havardottestad/Documents/wikidata/wikidata-20251208-all-BETA.nt.gz wikidata-20251208-all-BETA.hdt
 
