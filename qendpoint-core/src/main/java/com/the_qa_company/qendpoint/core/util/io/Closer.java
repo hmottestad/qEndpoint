@@ -99,7 +99,7 @@ public class Closer implements Iterable<Closeable>, Closeable {
 			return;
 
 		Deque<Object> stack = new ArrayDeque<>();
-		stack.push(root);
+		pushIfNotNull(stack, root);
 
 		while (!stack.isEmpty()) {
 			Object obj = stack.pop();
@@ -130,7 +130,7 @@ public class Closer implements Iterable<Closeable>, Closeable {
 				try {
 					Iterator<?> it = bs.iterator();
 					while (it.hasNext()) {
-						stack.push(it.next());
+						pushIfNotNull(stack, it.next());
 					}
 				} catch (Throwable t) {
 					// Record traversal failure as "high value" throwable.
@@ -150,7 +150,7 @@ public class Closer implements Iterable<Closeable>, Closeable {
 			if (obj instanceof Iterable<?> it) {
 				try {
 					for (Object e : it) {
-						stack.push(e);
+						pushIfNotNull(stack, e);
 					}
 				} catch (Throwable t) {
 					list.add(throwingHighValue(t));
@@ -164,7 +164,7 @@ public class Closer implements Iterable<Closeable>, Closeable {
 				// order
 				// for a LIFO stack.
 				for (int i = arr.length - 1; i >= 0; i--) {
-					stack.push(arr[i]);
+					pushIfNotNull(stack, arr[i]);
 				}
 				continue;
 			}
@@ -173,9 +173,9 @@ public class Closer implements Iterable<Closeable>, Closeable {
 			if (obj instanceof Map<?, ?> map) {
 				try {
 					for (Object v : map.values())
-						stack.push(v);
+						pushIfNotNull(stack, v);
 					for (Object k : map.keySet())
-						stack.push(k);
+						pushIfNotNull(stack, k);
 				} catch (Throwable t) {
 					list.add(throwingHighValue(t));
 				}
@@ -190,7 +190,7 @@ public class Closer implements Iterable<Closeable>, Closeable {
 					Method m = accessors[i];
 					try {
 						Object value = m.invoke(obj);
-						stack.push(value);
+						pushIfNotNull(stack, value);
 					} catch (IllegalAccessException | InvocationTargetException e) {
 						list.add(throwingHighValue(new IOException(
 								"Can't read record component via " + cls.getName() + "#" + m.getName(), e)));
@@ -208,6 +208,12 @@ public class Closer implements Iterable<Closeable>, Closeable {
 			}
 
 			// Unknown type: ignore
+		}
+	}
+
+	private static void pushIfNotNull(Deque<Object> stack, Object value) {
+		if (value != null) {
+			stack.push(value);
 		}
 	}
 
