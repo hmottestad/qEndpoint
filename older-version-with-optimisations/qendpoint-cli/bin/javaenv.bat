@@ -1,3 +1,0 @@
-set JAVAOPTIONS=-Xmx1G
-set JAVACMD=java
-set RDFHDT_COLOR=false
