@@ -25,7 +25,7 @@ public class MultiThreadListenerConsole implements MultiThreadListener {
 	private static final int BAR_SIZE = 10;
 	private static final String ERASE_LINE = "\r\033[K";
 	private static final long REFRESH_MILLIS = 300;
-	private static final long GC_WINDOW_MILLIS = 60_000L;
+	private static final long GC_WINDOW_MILLIS = 10_000L;
 	private static final GcMonitor GC_MONITOR = new GcMonitor();
 
 	private static String goBackNLine(int line) {
@@ -365,7 +365,7 @@ public class MultiThreadListenerConsole implements MultiThreadListener {
 		String gcPercent = GC_MONITOR.formatPercentLastMinute();
 		String uptime = formatUptime();
 		return colorReset() + "[" + colorThread() + "stats" + colorReset() + "] mem used/total: " + memory.format()
-				+ " | gc 60s: " + gcPercent + " | up: " + uptime;
+				+ " | GC: " + gcPercent + " | up: " + uptime;
 	}
 
 	private String formatUptime() {

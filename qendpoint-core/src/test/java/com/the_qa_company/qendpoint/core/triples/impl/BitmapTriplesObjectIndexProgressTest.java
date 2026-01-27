@@ -8,6 +8,8 @@ import com.the_qa_company.qendpoint.core.options.HDTOptionsKeys;
 import com.the_qa_company.qendpoint.core.options.HDTSpecification;
 import com.the_qa_company.qendpoint.core.util.LargeFakeDataSetStreamSupplier;
 import org.apache.commons.io.file.PathUtils;
+import org.junit.After;
+import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -22,13 +24,26 @@ public class BitmapTriplesObjectIndexProgressTest {
 	@Rule
 	public TemporaryFolder tempDir = TemporaryFolder.builder().assureDeletion().build();
 
+	int before;
+
+	@Before
+	public void setUp() {
+		before = BitmapTriples.REPORT_INTERVAL;
+		BitmapTriples.REPORT_INTERVAL = 1;
+	}
+
+	@After
+	public void tearDown() {
+		BitmapTriples.REPORT_INTERVAL = before;
+	}
+
 	@Test
 	public void objectIndexProgressReportsStagesAndThroughput() throws Exception {
 		Path root = tempDir.newFolder().toPath();
 		Path hdtPath = root.resolve("hdt.hdt");
 
 		try {
-			try (HDT hdt = LargeFakeDataSetStreamSupplier.createSupplierWithMaxTriples(5_000L, 42)
+			try (HDT hdt = LargeFakeDataSetStreamSupplier.createSupplierWithMaxTriples(500_000L, 42)
 					.createFakeHDT(new HDTSpecification())) {
 				hdt.saveToHDT(hdtPath.toAbsolutePath().toString(), null);
 			}
@@ -48,6 +63,9 @@ public class BitmapTriplesObjectIndexProgressTest {
 					messages.stream().anyMatch(m -> m.contains("object index: count objects")));
 			assertTrue("materialize object counts stage present",
 					messages.stream().anyMatch(m -> m.contains("object index: materialize object counts")));
+			long materializeCountMessages = messages.stream()
+					.filter(m -> m.contains("object index: materialize object counts")).count();
+			assertTrue("materialize object counts reports progress updates", materializeCountMessages > 2);
 			assertTrue("thousands separator present",
 					messages.stream().anyMatch(m -> m.matches(".*\\d{1,3},\\d{3}.*")));
 			assertTrue("throughput present", messages.stream().anyMatch(m -> m.contains("items/s")));

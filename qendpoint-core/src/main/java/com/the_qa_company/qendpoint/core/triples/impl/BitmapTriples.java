@@ -109,6 +109,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 	private static final int OBJECT_INDEX_PARALLEL_FILL_MIN_RECORDS = 1 << 15;
 	private static final int OBJECT_INDEX_PARALLEL_FILL_MIN_GROUPS = 4;
 	private static final long OBJECT_INDEX_PROGRESS_MIN_INTERVAL_MILLIS = 500L;
+	public static int REPORT_INTERVAL = 100_000;
 
 	protected TripleComponentOrder order;
 
@@ -129,10 +130,10 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 
 	protected boolean isClosed;
 	private int objectIndexParallelism = Runtime.getRuntime().availableProcessors();
-	private boolean objectIndexPipelineEnabled = false;
-	private boolean objectIndexBucketParallelWritesEnabled = false;
-	private boolean objectIndexBatchParallelFillEnabled = false;
-	private boolean objectIndexBatchProcessingPipelineEnabled = false;
+	private boolean objectIndexPipelineEnabled;
+	private boolean objectIndexBucketParallelWritesEnabled;
+	private boolean objectIndexBatchParallelFillEnabled;
+	private boolean objectIndexBatchProcessingPipelineEnabled;
 
 	public BitmapTriples() throws IOException {
 		this(new HDTSpecification());
@@ -201,7 +202,8 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		if (spec == null) {
 			return 1;
 		}
-		long configured = spec.getInt(HDTOptionsKeys.BITMAPTRIPLES_OBJECT_INDEX_PARALLELISM_KEY, 1);
+		long configured = spec.getInt(HDTOptionsKeys.BITMAPTRIPLES_OBJECT_INDEX_PARALLELISM_KEY,
+				Runtime.getRuntime()::availableProcessors);
 		if (configured == 0) {
 			configured = Runtime.getRuntime().availableProcessors();
 		}
@@ -868,7 +870,6 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 				try (BucketedSequenceWriter writer = BucketedSequenceWriter.create(diskLocation,
 						"bitmapTriples-objectIndexBuckets", totalEntries, bucketSize, bufferRecords)) {
 					boolean bucketParallelWrites = objectIndexParallelism > 1;
-					objectIndexBucketParallelWritesEnabled = bucketParallelWrites;
 					if (bucketParallelWrites) {
 						writer.setWriteParallelism(objectIndexParallelism);
 					}
@@ -876,10 +877,11 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 					// 2. Setup Batching (128k)
 					final int BATCH_SIZE = 128 * 1024;
 					boolean usePipeline = objectIndexParallelism > 1;
-					objectIndexPipelineEnabled = usePipeline;
 					boolean useParallelFill = objectIndexParallelism > 1;
-					objectIndexBatchParallelFillEnabled = useParallelFill;
 					boolean useBatchPipeline = objectIndexParallelism > 1;
+					objectIndexBucketParallelWritesEnabled = bucketParallelWrites;
+					objectIndexPipelineEnabled = usePipeline;
+					objectIndexBatchParallelFillEnabled = useParallelFill;
 					objectIndexBatchProcessingPipelineEnabled = useBatchPipeline;
 					int pipelineDepth = Math.min(4, Math.max(2, objectIndexParallelism));
 					ObjectIndexPipeline pipeline = usePipeline
@@ -2270,8 +2272,6 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		private final String stage;
 		private final long total;
 		private final long startMillis;
-		private final long minReportCount;
-		private long lastReportCount;
 		private long lastReportMillis;
 
 		private StageProgress(ProgressListener listener, String stage, long total) {
@@ -2280,17 +2280,14 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 			this.total = Math.max(0L, total);
 			this.startMillis = System.currentTimeMillis();
 			this.lastReportMillis = startMillis;
-			this.minReportCount = Math.max(1L, this.total / 1000L);
 		}
 
 		int sinceLastReport = 0;
 
 		private void report(long processed, boolean force) {
 			long clamped = Math.max(0L, Math.min(processed, total));
-			if (!force && (clamped - lastReportCount) < minReportCount) {
-				return;
-			}
-			if (sinceLastReport++ % 1_000_000 != 0 && !force) {
+
+			if (sinceLastReport++ % REPORT_INTERVAL != 0 && !force) {
 				return;
 			}
 
@@ -2298,7 +2295,6 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 			if (!force && (now - lastReportMillis) < OBJECT_INDEX_PROGRESS_MIN_INTERVAL_MILLIS) {
 				return;
 			}
-			lastReportCount = clamped;
 			lastReportMillis = now;
 
 			double elapsedSeconds = (now - startMillis) / 1_000d;
@@ -2320,6 +2316,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 	private static final class StageProgressListener implements ProgressListener {
 		private final StageProgress progress;
 		private final long total;
+		private long lastNotified = 0;
 
 		private StageProgressListener(ProgressListener listener, String stage, long total) {
 			this.total = Math.max(0L, total);
@@ -2330,7 +2327,7 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 		public void notifyProgress(float level, String message) {
 			float clampedLevel = Math.max(0f, Math.min(100f, level));
 			long processed = total > 0L ? (long) Math.floor(total * (clampedLevel / 100f)) : 0L;
-			progress.report(processed, clampedLevel >= 100f);
+			progress.report(processed, ++lastNotified % 100 == 0);
 		}
 	}
 
@@ -2633,6 +2630,10 @@ public class BitmapTriples implements TriplesPrivate, BitmapTriplesIndex {
 			throws IOException {
 		loadDiskSequence(specIndex);
 		objectIndexParallelism = resolveObjectIndexParallelism(specIndex);
+		objectIndexPipelineEnabled = false;
+		objectIndexBucketParallelWritesEnabled = false;
+		objectIndexBatchParallelFillEnabled = false;
+		objectIndexBatchProcessingPipelineEnabled = false;
 
 		String indexMethod = specIndex.get(HDTOptionsKeys.BITMAPTRIPLES_INDEX_METHOD_KEY,
 				HDTOptionsKeys.BITMAPTRIPLES_INDEX_METHOD_VALUE_RECOMMENDED);

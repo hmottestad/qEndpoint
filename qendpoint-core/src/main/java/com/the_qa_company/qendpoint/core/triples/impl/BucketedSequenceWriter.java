@@ -299,6 +299,8 @@ final class BucketedSequenceWriter implements Closeable {
 		}
 		long processed = 0;
 		int lastPercent = 0;
+		long reportEvery = Math.max(1L, totalEntries / 100L);
+		long nextReportAt = reportEvery;
 		for (int bucket = 0; bucket < bucketCount; bucket++) {
 			long bucketStart = (long) bucket * bucketSize;
 			long remaining = totalEntries - bucketStart;
@@ -324,16 +326,19 @@ final class BucketedSequenceWriter implements Closeable {
 						throw new IllegalStateException("Missing mapping for index=" + (bucketStart + i));
 					}
 					sequence.set(bucketStart + i, value);
+					processed++;
+					if (processed >= nextReportAt) {
+						int percent = (int) ((processed * 100d) / totalEntries);
+						if (percent > lastPercent) {
+							progressListener.notifyProgress(percent,
+									"Materializing object index " + processed + "/" + totalEntries);
+							lastPercent = percent;
+						}
+						nextReportAt += reportEvery;
+					}
 				}
 			} finally {
 				LongArrayPool.release(values);
-			}
-			processed += count;
-			int percent = (int) ((processed * 100d) / totalEntries);
-			if (percent > lastPercent) {
-				progressListener.notifyProgress(percent,
-						"Materializing object index " + processed + "/" + totalEntries);
-				lastPercent = percent;
 			}
 		}
 		progressListener.notifyProgress(100, "Materialized object index");
@@ -348,7 +353,8 @@ final class BucketedSequenceWriter implements Closeable {
 			return 0L;
 		}
 		long processed = 0;
-		int lastPercent = 0;
+		long reportEvery = Math.max(1L, maxEntries / 1000L);
+		long nextReportAt = reportEvery;
 		long maxCount = 0;
 		for (int bucket = 0; bucket < bucketCount; bucket++) {
 			long bucketStart = (long) bucket * bucketSize;
@@ -376,15 +382,16 @@ final class BucketedSequenceWriter implements Closeable {
 							maxCount = value;
 						}
 					}
+					processed++;
+					if (processed >= nextReportAt) {
+						int percent = (int) ((processed * 100d) / maxEntries);
+						progressListener.notifyProgress(percent,
+								"Materializing object counts " + processed + "/" + maxEntries);
+						nextReportAt += reportEvery;
+					}
 				}
 			} finally {
 				LongArrayPool.release(values);
-			}
-			processed += count;
-			int percent = (int) ((processed * 100d) / maxEntries);
-			if (percent > lastPercent) {
-				progressListener.notifyProgress(percent, "Materializing object counts " + processed + "/" + maxEntries);
-				lastPercent = percent;
 			}
 		}
 		progressListener.notifyProgress(100, "Materialized object counts");
