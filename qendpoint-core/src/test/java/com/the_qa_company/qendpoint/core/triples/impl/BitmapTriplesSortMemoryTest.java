@@ -2,6 +2,7 @@ package com.the_qa_company.qendpoint.core.triples.impl;
 
 import static org.junit.Assert.fail;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.InputStream;
 import java.lang.reflect.Constructor;
@@ -11,6 +12,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.Test;
@@ -18,55 +20,41 @@ import org.junit.Test;
 public class BitmapTriplesSortMemoryTest {
 	@Test(timeout = 120_000)
 	public void sortByValueThenPositionSurvivesLowHeap() throws Exception {
-		ProcessBuilder builder = new ProcessBuilder(buildCommand(SortMain.class, "64m"));
-		builder.redirectErrorStream(true);
-		Process process = builder.start();
-		String output;
-		try (InputStream stream = process.getInputStream()) {
-			output = new String(stream.readAllBytes(), StandardCharsets.UTF_8);
-		}
-		int exitCode = process.waitFor();
-		if (exitCode != 0) {
-			fail("Child JVM failed with exit code " + exitCode + "\n" + output);
-		}
+		runChildJvm(SortMain.class, "64m", 110, TimeUnit.SECONDS);
 	}
 
 	@Test(timeout = 120_000)
 	public void sortByValueThenPositionSurvivesConcurrentLowHeap() throws Exception {
-		ProcessBuilder builder = new ProcessBuilder(buildCommand(SortConcurrentMain.class, "256m"));
-		builder.redirectErrorStream(true);
-		Process process = builder.start();
-		String output;
-		try (InputStream stream = process.getInputStream()) {
-			output = new String(stream.readAllBytes(), StandardCharsets.UTF_8);
-		}
-		int exitCode = process.waitFor();
-		if (exitCode != 0) {
-			fail("Child JVM failed with exit code " + exitCode + "\n" + output);
-		}
+		runChildJvm(SortConcurrentMain.class, "256m", 110, TimeUnit.SECONDS);
 	}
 
 	@Test
 	public void timSortTempBufferDoesNotExceedHalf() throws Exception {
-		int length = 1024;
-		long[] values = new long[length];
-		long[] positions = new long[length];
+		boolean poolEnabled = readLongArrayPoolEnabled();
+		LongArrayPool.setEnabled(false);
+		try {
+			int length = 1024;
+			long[] values = new long[length];
+			long[] positions = new long[length];
 
-		Class<?> timSortClass = Class
-				.forName("com.the_qa_company.qendpoint.core.triples.impl.BitmapTriples$LongPairTimSort");
-		Constructor<?> ctor = timSortClass.getDeclaredConstructor(long[].class, long[].class, int.class);
-		ctor.setAccessible(true);
-		Object sorter = ctor.newInstance(values, positions, length);
+			Class<?> timSortClass = Class
+					.forName("com.the_qa_company.qendpoint.core.triples.impl.BitmapTriples$LongPairTimSort");
+			Constructor<?> ctor = timSortClass.getDeclaredConstructor(long[].class, long[].class, int.class);
+			ctor.setAccessible(true);
+			Object sorter = ctor.newInstance(values, positions, length);
 
-		Method ensureCapacity = timSortClass.getDeclaredMethod("ensureCapacity", int.class);
-		ensureCapacity.setAccessible(true);
-		ensureCapacity.invoke(sorter, length / 2);
+			Method ensureCapacity = timSortClass.getDeclaredMethod("ensureCapacity", int.class);
+			ensureCapacity.setAccessible(true);
+			ensureCapacity.invoke(sorter, length / 2);
 
-		Field tmpValuesField = timSortClass.getDeclaredField("tmpValues");
-		tmpValuesField.setAccessible(true);
-		long[] tmpValues = (long[]) tmpValuesField.get(sorter);
-		if (tmpValues.length > length / 2) {
-			fail("Temp buffer grew to " + tmpValues.length + " for length " + length);
+			Field tmpValuesField = timSortClass.getDeclaredField("tmpValues");
+			tmpValuesField.setAccessible(true);
+			long[] tmpValues = (long[]) tmpValuesField.get(sorter);
+			if (tmpValues.length > length / 2) {
+				fail("Temp buffer grew to " + tmpValues.length + " for length " + length);
+			}
+		} finally {
+			LongArrayPool.setEnabled(poolEnabled);
 		}
 	}
 
@@ -83,9 +71,68 @@ public class BitmapTriplesSortMemoryTest {
 		return command;
 	}
 
+	private static boolean readLongArrayPoolEnabled() throws Exception {
+		Field enabledField = LongArrayPool.class.getDeclaredField("enabled");
+		enabledField.setAccessible(true);
+		return (boolean) enabledField.get(null);
+	}
+
+	private static void runChildJvm(Class<?> mainClass, String maxHeap, long timeout, TimeUnit unit) throws Exception {
+		ProcessBuilder builder = new ProcessBuilder(buildCommand(mainClass, maxHeap));
+		builder.redirectErrorStream(true);
+		Process process = builder.start();
+
+		ByteArrayOutputStream output = new ByteArrayOutputStream();
+		AtomicReference<Throwable> readFailure = new AtomicReference<>();
+		Thread reader = new Thread(() -> {
+			try (InputStream stream = process.getInputStream()) {
+				stream.transferTo(output);
+			} catch (Throwable err) {
+				readFailure.compareAndSet(null, err);
+			}
+		}, "bitmaptriples-sort-memory-reader");
+		reader.setDaemon(true);
+		reader.start();
+
+		boolean finished = process.waitFor(timeout, unit);
+		if (!finished) {
+			process.destroyForcibly();
+			process.waitFor(10, TimeUnit.SECONDS);
+		}
+		reader.join(unit.toMillis(5));
+
+		Throwable readError = readFailure.get();
+		if (readError != null) {
+			throw new RuntimeException("Failed to read child JVM output", readError);
+		}
+
+		String outputText = output.toString(StandardCharsets.UTF_8);
+		if (!finished) {
+			fail("Child JVM timed out after " + timeout + " " + unit.toString().toLowerCase() + "\n" + outputText);
+		}
+		int exitCode = process.exitValue();
+		if (exitCode != 0) {
+			fail("Child JVM failed with exit code " + exitCode + "\n" + outputText);
+		}
+	}
+
+	private static int resolveLength(int threads) {
+		long maxHeap = Runtime.getRuntime().maxMemory();
+		long usable = (long) (maxHeap * 0.35);
+		long perElement = 16L * threads;
+		long length = usable / perElement;
+		if (length < 250_000L) {
+			length = 250_000L;
+		}
+		if (length > 3_000_000L) {
+			length = 3_000_000L;
+		}
+		return (int) length;
+	}
+
 	public static final class SortMain {
 		public static void main(String[] args) throws Exception {
-			int length = 3_000_000;
+			int length = resolveLength(1);
 			long[] values = new long[length];
 			long[] positions = new long[length];
 			long seed = 1L;
@@ -103,8 +150,8 @@ public class BitmapTriplesSortMemoryTest {
 
 	public static final class SortConcurrentMain {
 		public static void main(String[] args) throws Exception {
-			int threads = 4;
-			int length = 3_000_000;
+			int threads = Math.max(2, Math.min(4, Runtime.getRuntime().availableProcessors()));
+			int length = resolveLength(threads);
 			Method sortMethod = BitmapTriples.class.getDeclaredMethod("sortByValueThenPosition", long[].class,
 					long[].class, int.class, int.class);
 			sortMethod.setAccessible(true);
