@@ -16,13 +16,12 @@ import com.the_qa_company.qendpoint.core.hdt.impl.diskimport.MapOnCallHDT;
 import com.the_qa_company.qendpoint.core.hdt.impl.diskimport.SectionCompressor;
 import com.the_qa_company.qendpoint.core.hdt.impl.diskimport.TripleCompressionResult;
 import com.the_qa_company.qendpoint.core.header.HeaderPrivate;
-import com.the_qa_company.qendpoint.core.iterator.utils.FileTripleIterator;
+import com.the_qa_company.qendpoint.core.iterator.utils.AsyncIteratorFetcherUnordered;
 import com.the_qa_company.qendpoint.core.iterator.utils.IteratorChunkedSource;
 import com.the_qa_company.qendpoint.core.listener.MultiThreadListener;
 import com.the_qa_company.qendpoint.core.listener.ProgressListener;
 import com.the_qa_company.qendpoint.core.options.HDTOptions;
 import com.the_qa_company.qendpoint.core.options.HDTOptionsKeys;
-import com.the_qa_company.qendpoint.core.quad.QuadString;
 import com.the_qa_company.qendpoint.core.rdf.parsers.NTriplesChunkedSource;
 import com.the_qa_company.qendpoint.core.triples.TempTriples;
 import com.the_qa_company.qendpoint.core.triples.TripleID;
@@ -204,17 +203,11 @@ public class HDTDiskImporter implements Closeable {
 
 		profiler.pushSection("section compression");
 		CompressionResult compressionResult;
-		try (IteratorChunkedSource<TripleString> chunkSource = IteratorChunkedSource.of(iterator,
-				FileTripleIterator::estimateSize, chunkSize, triple -> {
-					if (triple instanceof QuadString) {
-						return new QuadString(triple);
-					}
-					return new TripleString(triple);
-				})) {
-			compressionResult = DictionaryFactory.createSectionCompressorPull(hdtFormat,
-					basePath.resolve("sectionCompression"), listener, bufferSize, chunkSize, 1 << ways,
-					hdtFormat.getBoolean("debug.disk.slow.stream2"), compressionType)
-					.compressPull(workers, compressMode, chunkSource);
+		AsyncIteratorFetcherUnordered<TripleString> source = new AsyncIteratorFetcherUnordered<>(iterator);
+		try {
+			compressionResult = DictionaryFactory.createSectionCompressor(hdtFormat,
+					basePath.resolve("sectionCompression"), source, listener, bufferSize, chunkSize, 1 << ways,
+					hdtFormat.getBoolean("debug.disk.slow.stream2"), compressionType).compress(workers, compressMode);
 		} catch (KWayMerger.KWayMergerException | InterruptedException e) {
 			throw new ParserException(e);
 		}
