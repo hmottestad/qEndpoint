@@ -417,18 +417,18 @@ public class HDTManagerImpl extends HDTManager {
 			CompressionType compressionType, HDTOptions hdtFormat, ProgressListener listener)
 			throws IOException, ParserException {
 		if (compressionType == CompressionType.NONE) {
-			if ((rdfNotation == RDFNotation.NTRIPLES || rdfNotation == RDFNotation.NQUAD)
-					&& RDFParserFactory.useSimple(hdtFormat)) {
-				if (!IOUtil.isRemoteURL(rdfFileName) && !"-".equals(rdfFileName)) {
-					Path path = Path.of(rdfFileName);
-					try (HDTDiskImporter hdtDiskImporter = new HDTDiskImporter(hdtFormat, listener, baseURI)) {
-						return HDTResult.of(hdtDiskImporter.runAllStepsNTriples(path, rdfNotation));
-					}
-				}
-				try (InputStream stream = IOUtil.getFileInputStream(rdfFileName, false)) {
-					return doGenerateHDTDisk(stream, baseURI, rdfNotation, compressionType, hdtFormat, listener);
-				}
-			}
+//			if ((rdfNotation == RDFNotation.NTRIPLES || rdfNotation == RDFNotation.NQUAD)
+//					&& RDFParserFactory.useSimple(hdtFormat)) {
+//				if (!IOUtil.isRemoteURL(rdfFileName) && !"-".equals(rdfFileName)) {
+//					Path path = Path.of(rdfFileName);
+//					try (HDTDiskImporter hdtDiskImporter = new HDTDiskImporter(hdtFormat, listener, baseURI)) {
+//						return HDTResult.of(hdtDiskImporter.runAllStepsNTriples(path, rdfNotation));
+//					}
+//				}
+//				try (InputStream stream = IOUtil.getFileInputStream(rdfFileName, false)) {
+//					return doGenerateHDTDisk(stream, baseURI, rdfNotation, compressionType, hdtFormat, listener);
+//				}
+//			}
 			RDFParserCallback parser = RDFParserFactory.getParserCallback(rdfNotation, hdtFormat);
 			try (PipedCopyIterator<TripleString> iterator = RDFParserFactory.readAsIterator(parser, rdfFileName,
 					baseURI, true, rdfNotation, hdtFormat)) {

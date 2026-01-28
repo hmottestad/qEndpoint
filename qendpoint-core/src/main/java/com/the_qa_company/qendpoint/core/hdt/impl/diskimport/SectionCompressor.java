@@ -1,22 +1,22 @@
 package com.the_qa_company.qendpoint.core.hdt.impl.diskimport;
 
 import com.the_qa_company.qendpoint.core.enums.CompressionType;
+import com.the_qa_company.qendpoint.core.iterator.utils.AsyncIteratorFetcher;
+import com.the_qa_company.qendpoint.core.iterator.utils.SizeFetcher;
+import com.the_qa_company.qendpoint.core.iterator.utils.SizedSupplier;
 import com.the_qa_company.qendpoint.core.listener.MultiThreadListener;
 import com.the_qa_company.qendpoint.core.triples.IndexedNode;
 import com.the_qa_company.qendpoint.core.triples.TripleString;
 import com.the_qa_company.qendpoint.core.util.ParallelSortableArrayList;
-import com.the_qa_company.qendpoint.core.util.io.compress.CompressNodeMergeIterator;
-import com.the_qa_company.qendpoint.core.util.io.compress.CompressNodeReader;
-import com.the_qa_company.qendpoint.core.util.io.compress.CompressUtil;
-import com.the_qa_company.qendpoint.core.iterator.utils.AsyncIteratorFetcher;
-import com.the_qa_company.qendpoint.core.iterator.utils.SizeFetcher;
-import com.the_qa_company.qendpoint.core.iterator.utils.SizedSupplier;
 import com.the_qa_company.qendpoint.core.util.concurrent.ExceptionFunction;
 import com.the_qa_company.qendpoint.core.util.concurrent.ExceptionSupplier;
 import com.the_qa_company.qendpoint.core.util.concurrent.KWayMerger;
 import com.the_qa_company.qendpoint.core.util.concurrent.KWayMergerChunked;
 import com.the_qa_company.qendpoint.core.util.io.CloseSuppressPath;
 import com.the_qa_company.qendpoint.core.util.io.IOUtil;
+import com.the_qa_company.qendpoint.core.util.io.compress.CompressNodeMergeIterator;
+import com.the_qa_company.qendpoint.core.util.io.compress.CompressNodeReader;
+import com.the_qa_company.qendpoint.core.util.io.compress.CompressUtil;
 import com.the_qa_company.qendpoint.core.util.listener.IntermediateListener;
 import com.the_qa_company.qendpoint.core.util.string.ByteString;
 import com.the_qa_company.qendpoint.core.util.string.CompactString;
@@ -36,6 +36,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
@@ -61,7 +62,7 @@ public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString
 
 	private final CloseSuppressPath baseFileName;
 	private final AsyncIteratorFetcher<TripleString> source; // may be null in
-																// pull-mode
+	// pull-mode
 	private final MultiThreadListener listener;
 	private final AtomicLong triples = new AtomicLong();
 	private final AtomicLong ntRawSize = new AtomicLong();
@@ -623,6 +624,9 @@ public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString
 		 *                              thread
 		 */
 		public void compute(List<TripleFile> triples, boolean async) throws IOException, InterruptedException {
+			if (Thread.currentThread().isInterrupted()) {
+				throw new InterruptedException();
+			}
 			List<Future<?>> futures = new ArrayList<>(supportsGraph() ? 4 : 3);
 			futures.add(MERGE_EXECUTOR.submit(() -> {
 				try {
@@ -659,6 +663,9 @@ public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString
 				}));
 			}
 			awaitMergeTasks(futures);
+			if (Thread.currentThread().isInterrupted()) {
+				throw new InterruptedException();
+			}
 		}
 
 		private void computeSubject(List<TripleFile> triples, boolean async) throws IOException {
@@ -732,7 +739,19 @@ public class SectionCompressor implements KWayMerger.KWayMergerImpl<TripleString
 	private static void awaitMergeTasks(List<Future<?>> futures) throws IOException, InterruptedException {
 		try {
 			for (Future<?> future : futures) {
-				future.get();
+
+				while (true) {
+					try {
+						future.get(1, TimeUnit.SECONDS);
+						break;
+					} catch (TimeoutException e) {
+						// ignored
+					}
+					if (Thread.currentThread().isInterrupted()) {
+						throw new InterruptedException();
+					}
+				}
+
 			}
 		} catch (InterruptedException e) {
 			cancelMergeTasks(futures);

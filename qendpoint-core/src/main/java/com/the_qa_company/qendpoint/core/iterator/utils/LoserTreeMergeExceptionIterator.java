@@ -58,6 +58,10 @@ public class LoserTreeMergeExceptionIterator<T, E extends Exception> implements 
 			return true;
 		}
 
+		if (Thread.currentThread().isInterrupted()) {
+			return false;
+		}
+
 		// Fast-path: check initialization
 		if (!initialized) {
 			initialize();
