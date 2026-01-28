@@ -13,6 +13,8 @@ import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 
 import java.io.IOException;
+import java.net.URISyntaxException;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -39,7 +41,13 @@ public class TempHDTImporterTest {
 	}
 
 	private String getFile(String f) {
-		return Objects.requireNonNull(getClass().getClassLoader().getResource(f), "Can't find " + f).getFile();
+		try {
+			return Paths
+					.get(Objects.requireNonNull(getClass().getClassLoader().getResource(f), "Can't find " + f).toURI())
+					.toString();
+		} catch (URISyntaxException e) {
+			throw new IllegalStateException("Invalid resource URI: " + f, e);
+		}
 	}
 
 	@Test

@@ -11,15 +11,26 @@ import com.the_qa_company.qendpoint.core.triples.impl.utils.HDTTestUtils;
 import org.junit.Test;
 
 import java.io.IOException;
+import java.net.URISyntaxException;
+import java.nio.file.Paths;
 import java.util.*;
 
 import static org.junit.Assert.assertEquals;
 
 public class UnicodeEscapeTest {
+	private static String resourcePath(String resource) {
+		try {
+			return Paths.get(Objects
+					.requireNonNull(UnicodeEscapeTest.class.getClassLoader().getResource(resource), "can't find file")
+					.toURI()).toString();
+		} catch (URISyntaxException e) {
+			throw new IllegalStateException("Invalid resource URI: " + resource, e);
+		}
+	}
+
 	@Test
 	public void encodeTest() throws ParserException {
-		String file = Objects.requireNonNull(UnicodeEscapeTest.class.getClassLoader().getResource("unicodeTest.nt"),
-				"can't find file").getFile();
+		String file = resourcePath("unicodeTest.nt");
 
 		RDFParserCallback factory = RDFParserFactory.getParserCallback(RDFNotation.NTRIPLES,
 				HDTOptions.of(Map.of(HDTOptionsKeys.NT_SIMPLE_PARSER_KEY, "true")));
