@@ -620,6 +620,8 @@ public class IOUtil {
 		}
 	}
 
+	private static final byte[] longWriteBuffer = new byte[8];
+
 	/**
 	 * Write long, little endian
 	 *
@@ -628,16 +630,15 @@ public class IOUtil {
 	 * @throws IOException io exception
 	 */
 	public static void writeLong(OutputStream output, long value) throws IOException {
-		byte[] writeBuffer = new byte[8];
-		writeBuffer[7] = (byte) (value >>> 56);
-		writeBuffer[6] = (byte) (value >>> 48);
-		writeBuffer[5] = (byte) (value >>> 40);
-		writeBuffer[4] = (byte) (value >>> 32);
-		writeBuffer[3] = (byte) (value >>> 24);
-		writeBuffer[2] = (byte) (value >>> 16);
-		writeBuffer[1] = (byte) (value >>> 8);
-		writeBuffer[0] = (byte) (value);
-		output.write(writeBuffer, 0, 8);
+		longWriteBuffer[7] = (byte) (value >>> 56);
+		longWriteBuffer[6] = (byte) (value >>> 48);
+		longWriteBuffer[5] = (byte) (value >>> 40);
+		longWriteBuffer[4] = (byte) (value >>> 32);
+		longWriteBuffer[3] = (byte) (value >>> 24);
+		longWriteBuffer[2] = (byte) (value >>> 16);
+		longWriteBuffer[1] = (byte) (value >>> 8);
+		longWriteBuffer[0] = (byte) (value);
+		output.write(longWriteBuffer, 0, 8);
 	}
 
 	/**

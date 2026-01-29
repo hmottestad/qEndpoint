@@ -43,7 +43,7 @@ import java.io.InputStream;
  */
 public class RDFParserFactory {
 	public static boolean useSimple(HDTOptions options) {
-		return options != null && options.getBoolean(HDTOptionsKeys.NT_SIMPLE_PARSER_KEY, false);
+		return options != null && options.getBoolean(HDTOptionsKeys.NT_SIMPLE_PARSER_KEY, true);
 	}
 
 	public static RDFParserCallback getParserCallback(RDFNotation notation) {
@@ -128,7 +128,7 @@ public class RDFParserFactory {
 	public static PipedCopyIterator<TripleString> readAsIterator(RDFParserCallback parser, InputStream stream,
 			String baseUri, boolean keepBNode, RDFNotation notation, HDTOptions spec) {
 		return PipedCopyIteratorUnordered.createUnorderedOfCallback(pipe -> parser.doParse(stream, baseUri, notation,
-				keepBNode, (triple, pos) -> pipe.addElement(triple.tripleToString())));
+				keepBNode, (triple, pos) -> pipe.addElement(triple.tripleToString()), true));
 	}
 
 	/**
