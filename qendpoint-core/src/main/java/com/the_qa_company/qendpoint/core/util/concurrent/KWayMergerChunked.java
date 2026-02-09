@@ -1,6 +1,6 @@
 package com.the_qa_company.qendpoint.core.util.concurrent;
 
-import com.the_qa_company.qendpoint.core.iterator.utils.AsyncIteratorFetcher;
+import com.the_qa_company.qendpoint.core.util.concurrent.KWayMerger.KWayMergerException;
 import com.the_qa_company.qendpoint.core.util.io.CloseSuppressPath;
 import com.the_qa_company.qendpoint.core.util.io.IOUtil;
 
@@ -15,20 +15,24 @@ import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 /**
- * Object to perform k-Way-Merge using an {@link AsyncIteratorFetcher}
- *
- * @param <E> merge object type
- * @author Antoine Willerval
+ * K-way merge where "source data" is not a single shared element supplier, but
+ * a supplier of per-chunk fluxes. Each chunk flux is consumed by a single
+ * worker. This avoids per-element contention and lets each worker own a whole
+ * chunk end-to-end.
  */
-public class KWayMerger<E, S extends Supplier<E>> {
+public class KWayMergerChunked<E, S extends Supplier<E>> {
+
 	private static final AtomicInteger ID = new AtomicInteger();
+
 	private final int k;
 	private final int maxConcurrentMerges;
-	private final AsyncIteratorFetcher<E> iteratorFetcher;
-	private final KWayMergerImpl<E, S> impl;
+	private final ExceptionSupplier<S, IOException> chunkSupplier;
+	private final KWayMergerChunkedImpl<E, S> impl;
 	private final Worker[] workers;
+
 	private final AtomicLong pathId = new AtomicLong();
 	private final CloseSuppressPath workLocation;
+
 	private final ReentrantLock dataLock = new ReentrantLock();
 	private final Condition taskAvailable = dataLock.newCondition();
 	private boolean started;
@@ -37,37 +41,26 @@ public class KWayMerger<E, S extends Supplier<E>> {
 	private int activeMerges;
 	private Throwable throwable;
 
-	/**
-	 * kwaymerger
-	 *
-	 * @param workLocation location to store the chunks
-	 * @param syncSupplier the element supplier
-	 * @param impl         implementation of {@link KWayMergerImpl} to
-	 *                     create/handle the chunks
-	 * @param workers      the number of workers
-	 * @param k            the k in the k-way merge
-	 */
-	public KWayMerger(CloseSuppressPath workLocation, AsyncIteratorFetcher<E> syncSupplier, KWayMergerImpl<E, S> impl,
-			int workers, int k) throws KWayMergerException {
-		this(workLocation, syncSupplier, impl, workers, k, workers);
+	public KWayMergerChunked(CloseSuppressPath workLocation, ExceptionSupplier<S, IOException> chunkSupplier,
+			KWayMergerChunkedImpl<E, S> impl, int workers, int k) throws KWayMergerException {
+		this(workLocation, chunkSupplier, impl, workers, k, workers);
 	}
 
 	/**
-	 * kwaymerger with a configurable limit on concurrent merge tasks.
+	 * K-way merge with a configurable limit on concurrent merge tasks.
 	 *
 	 * @param workLocation        location to store the chunks
-	 * @param syncSupplier        the element supplier
-	 * @param impl                implementation of {@link KWayMergerImpl} to
-	 *                            create/handle the chunks
-	 * @param workers             the number of worker threads
-	 * @param k                   the k in the k-way merge
+	 * @param chunkSupplier       supplier of per-chunk fluxes
+	 * @param impl                implementation that creates/merges chunks
+	 * @param workers             number of worker threads
+	 * @param k                   merge fan-in
 	 * @param maxConcurrentMerges maximum number of merge tasks to run
 	 *                            concurrently
 	 */
-	public KWayMerger(CloseSuppressPath workLocation, AsyncIteratorFetcher<E> syncSupplier, KWayMergerImpl<E, S> impl,
-			int workers, int k, int maxConcurrentMerges) throws KWayMergerException {
+	public KWayMergerChunked(CloseSuppressPath workLocation, ExceptionSupplier<S, IOException> chunkSupplier,
+			KWayMergerChunkedImpl<E, S> impl, int workers, int k, int maxConcurrentMerges) throws KWayMergerException {
 		this.workLocation = workLocation;
-		this.iteratorFetcher = syncSupplier;
+		this.chunkSupplier = chunkSupplier;
 		this.impl = impl;
 		this.k = k;
 		this.maxConcurrentMerges = Math.max(1, maxConcurrentMerges);
@@ -81,16 +74,13 @@ public class KWayMerger<E, S extends Supplier<E>> {
 		this.workers = new Worker[workers];
 		int id = ID.incrementAndGet();
 		for (int i = 0; i < workers; i++) {
-			this.workers[i] = new Worker("KWayMerger#" + id + "Worker#" + i, this);
+			this.workers[i] = new Worker("KWayMergerChunked#" + id + "Worker#" + i, this);
 		}
 	}
 
-	/**
-	 * start all the workers
-	 */
 	public void start() {
 		if (started) {
-			throw new IllegalArgumentException("The KWayMerger was already started and can't be reused!");
+			throw new IllegalArgumentException("The KWayMergerChunked was already started and can't be reused!");
 		}
 		started = true;
 		for (Worker w : workers) {
@@ -109,17 +99,9 @@ public class KWayMerger<E, S extends Supplier<E>> {
 		}
 	}
 
-	/**
-	 * wait the result and return it (if any), this method isn't thread safe and
-	 * can't be called twice
-	 *
-	 * @return optional of the result
-	 * @throws InterruptedException wait interupption
-	 * @throws KWayMergerException  exception while merging
-	 */
 	public Optional<CloseSuppressPath> waitResult() throws InterruptedException, KWayMergerException {
 		if (!started) {
-			throw new IllegalArgumentException("The KWayMerger hasn't been started!");
+			throw new IllegalArgumentException("The KWayMergerChunked hasn't been started!");
 		}
 		for (Worker w : workers) {
 			w.join();
@@ -150,55 +132,10 @@ public class KWayMerger<E, S extends Supplier<E>> {
 		void run() throws KWayMergerException;
 	}
 
-	/**
-	 * implementation to handle the chunks
-	 *
-	 * @param <E> chunk types
-	 */
-	public interface KWayMergerImpl<E, S extends Supplier<E>> {
-		/**
-		 * create a chunk from a flux, the flux is the returned by
-		 * {@link #newStopFlux(Supplier)}
-		 *
-		 * @param flux   flux to handle
-		 * @param output output to write the chunk
-		 * @throws KWayMergerException any exception returned by this method's
-		 *                             implementation
-		 */
-		void createChunk(S flux, CloseSuppressPath output) throws KWayMergerException;
-
-		/**
-		 * merge chunks together into a new chunk
-		 *
-		 * @param inputs the chunks
-		 * @param output the output chunk
-		 * @throws KWayMergerException any exception returned by this method's
-		 *                             implementation
-		 */
-		void mergeChunks(List<CloseSuppressPath> inputs, CloseSuppressPath output) throws KWayMergerException;
-
-		/**
-		 * create a flux from another one to tell when to stop
-		 *
-		 * @param flux the flux
-		 * @return the new flux
-		 * @throws KWayMergerException any exception returned by this method's
-		 *                             implementation
-		 */
-		S newStopFlux(Supplier<E> flux) throws KWayMergerException;
-	}
-
-	/**
-	 * @return a unique path into the work location
-	 */
 	private CloseSuppressPath getPath() {
 		return workLocation.resolve("f-" + pathId.incrementAndGet());
 	}
 
-	/**
-	 * @return thread safe method to get a method to handle or null if no other
-	 *         tasks are required
-	 */
 	private KWayMergerRunnable getTask() {
 		dataLock.lock();
 		try {
@@ -207,13 +144,11 @@ public class KWayMerger<E, S extends Supplier<E>> {
 					if (chunks.size() <= 1) {
 						return null;
 					}
-
 					if (activeMerges < maxConcurrentMerges) {
 						List<Chunk> all = chunks.getAll(k);
 						activeMerges++;
 						return new MergeTask(all);
 					}
-
 					try {
 						taskAvailable.await();
 					} catch (InterruptedException e) {
@@ -225,7 +160,6 @@ public class KWayMerger<E, S extends Supplier<E>> {
 
 				if (activeMerges < maxConcurrentMerges) {
 					List<Chunk> chunkList = chunks.getMax(k);
-
 					if (chunkList != null) {
 						activeMerges++;
 						return new MergeTask(chunkList);
@@ -242,23 +176,24 @@ public class KWayMerger<E, S extends Supplier<E>> {
 	private class MergeTask implements KWayMergerRunnable {
 		private final List<Chunk> chunks;
 
-		public MergeTask(List<Chunk> chunks) {
-			assert !chunks.isEmpty() : "empty chunks";
+		private MergeTask(List<Chunk> chunks) {
 			this.chunks = chunks;
 		}
 
 		@Override
 		public void run() throws KWayMergerException {
 			try {
-				int chunk = chunks.stream().mapToInt(Chunk::getHeight).max().orElseThrow() + 1;
-				CloseSuppressPath mergec = getPath();
+				int height = chunks.stream().mapToInt(Chunk::getHeight).max().orElseThrow() + 1;
+				CloseSuppressPath mergeOut = getPath();
+
 				List<CloseSuppressPath> paths = chunks.stream().map(Chunk::getPath)
 						.collect(Collectors.toUnmodifiableList());
+
 				KWayMergerException mergeException = null;
 				RuntimeException runtimeException = null;
 				Error error = null;
 				try {
-					impl.mergeChunks(paths, mergec);
+					impl.mergeChunks(paths, mergeOut);
 				} catch (KWayMergerException e) {
 					mergeException = e;
 					throw e;
@@ -283,9 +218,10 @@ public class KWayMerger<E, S extends Supplier<E>> {
 						}
 					}
 				}
+
 				dataLock.lock();
 				try {
-					KWayMerger.this.chunks.addElement(new Chunk(chunk, mergec), chunk);
+					KWayMergerChunked.this.chunks.addElement(new Chunk(height, mergeOut), height);
 					taskAvailable.signalAll();
 				} finally {
 					dataLock.unlock();
@@ -303,16 +239,32 @@ public class KWayMerger<E, S extends Supplier<E>> {
 	}
 
 	private class GetTask implements KWayMergerRunnable {
-
 		@Override
 		public void run() throws KWayMergerException {
-			CloseSuppressPath chunk = getPath();
-			S flux = impl.newStopFlux(iteratorFetcher);
-			impl.createChunk(flux, chunk);
+			final S flux;
+			try {
+				flux = chunkSupplier.get();
+			} catch (IOException e) {
+				throw new KWayMergerException(e);
+			}
+
+			if (flux == null) {
+				dataLock.lock();
+				try {
+					end = true;
+					taskAvailable.signalAll();
+				} finally {
+					dataLock.unlock();
+				}
+				return;
+			}
+
+			CloseSuppressPath out = getPath();
+			impl.createChunk(flux, out);
+
 			dataLock.lock();
 			try {
-				end = iteratorFetcher.isEnd();
-				Chunk newChunk = new Chunk(1, chunk);
+				Chunk newChunk = new Chunk(1, out);
 				chunks.addElement(newChunk, newChunk.getHeight());
 				taskAvailable.signalAll();
 			} finally {
@@ -325,24 +277,24 @@ public class KWayMerger<E, S extends Supplier<E>> {
 		private final int height;
 		private final CloseSuppressPath path;
 
-		public Chunk(int height, CloseSuppressPath path) {
+		private Chunk(int height, CloseSuppressPath path) {
 			this.height = height;
 			this.path = path;
 		}
 
-		public int getHeight() {
+		int getHeight() {
 			return height;
 		}
 
-		public CloseSuppressPath getPath() {
+		CloseSuppressPath getPath() {
 			return path;
 		}
 	}
 
 	private static class Worker extends ExceptionThread {
-		private final KWayMerger<?, ?> parent;
+		private final KWayMergerChunked<?, ?> parent;
 
-		public Worker(String name, KWayMerger<?, ?> parent) {
+		private Worker(String name, KWayMergerChunked<?, ?> parent) {
 			super(name);
 			this.parent = parent;
 		}
@@ -351,7 +303,6 @@ public class KWayMerger<E, S extends Supplier<E>> {
 		public void runException() throws Exception {
 			try {
 				KWayMergerRunnable task;
-
 				while (!isInterrupted() && (task = parent.getTask()) != null) {
 					task.run();
 				}
@@ -362,24 +313,15 @@ public class KWayMerger<E, S extends Supplier<E>> {
 		}
 	}
 
-	/**
-	 * Exception linked with the {@link KWayMerger}, this class isn't a
-	 * {@link RuntimeException} because these exceptions should be seriously
-	 * considered
-	 *
-	 * @author Antoine Willerval
-	 */
-	public static class KWayMergerException extends Exception {
-		public KWayMergerException(String message) {
-			super(message);
-		}
+	public interface KWayMergerChunkedImpl<E, S extends Supplier<E>> {
+		void createChunk(S flux, CloseSuppressPath output) throws KWayMergerException;
 
-		public KWayMergerException(String message, Throwable cause) {
-			super(message, cause);
-		}
-
-		public KWayMergerException(Throwable cause) {
-			super(cause);
-		}
+		/**
+		 * Merge chunks together into a new chunk.
+		 * <p>
+		 * Note: the merger owns the lifecycle of {@code inputs}.
+		 * Implementations must not close/delete the input paths.
+		 */
+		void mergeChunks(List<CloseSuppressPath> inputs, CloseSuppressPath output) throws KWayMergerException;
 	}
 }
