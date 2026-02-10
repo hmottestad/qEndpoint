@@ -58,3 +58,14 @@ data
 wikidata
 qendpoint-store/wdbench-indexes
 wdbench-results
+
+# REMOVE CHANGES BELOW
+.m2_repo
+/indexing/
+/dev-branch-copy/
+/ci-logs/
+/.codex/
+AGENTS.md
+PLANS.md
+
+/branch-with-faster-code/
